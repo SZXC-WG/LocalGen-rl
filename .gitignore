@@ -1,2 +1,7 @@
 build/
 .cache/
+__pycache__/
+*.pyc
+rl/checkpoints/
+rl/datasets/
+rl/runs/

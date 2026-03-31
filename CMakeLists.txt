@@ -15,6 +15,7 @@ find_package(Qt6 6.7 REQUIRED COMPONENTS Widgets Svg Network Charts)
 set(LOCALGEN_BOT_SOURCES
     src/bots/smartRandomBot.cpp
     src/bots/xiaruizeBot.cpp
+    src/bots/xrzBot.cpp
     src/bots/szlyBot.cpp
     src/bots/zlyBot.cpp
     src/bots/zlyBot_v2.cpp
@@ -106,6 +107,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Widgets Qt6::Svg Qt6::Network
 add_executable(LocalGen-bot-simulator
     simulator/botSimulator.cpp
     ${LOCALGEN_BOT_SOURCES}
+    src/bots/xrzPolicy.h
     src/core/board.hpp
     src/core/bot.h
     src/core/game.hpp
@@ -123,6 +125,28 @@ target_include_directories(LocalGen-bot-simulator PRIVATE
 )
 
 target_link_libraries(LocalGen-bot-simulator PRIVATE Qt6::Core)
+
+add_executable(LocalGen-bot-imitation-dump
+    simulator/xrzImitationDump.cpp
+    ${LOCALGEN_BOT_SOURCES}
+    src/bots/xrzPolicy.h
+    src/core/board.hpp
+    src/core/bot.h
+    src/core/game.hpp
+    src/core/map.hpp
+    src/core/message.hpp
+    src/core/move.hpp
+    src/core/player.hpp
+    src/core/tile.hpp
+    src/core/utils.hpp
+)
+
+target_include_directories(LocalGen-bot-imitation-dump PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(LocalGen-bot-imitation-dump PRIVATE Qt6::Core)
 
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory

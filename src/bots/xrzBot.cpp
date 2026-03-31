@@ -1,185 +1,200 @@
 /**
  * @file xrzBot.cpp
  *
- * XrzBot from LocalGen v5.
- * Author: xiaruize0911
- *
- * @copyright Copyright (c) SZXC Work Group.
+ * RL-guided XrzBot with shared feature extraction used by both inference and
+ * imitation-learning data export.
  */
 
 #ifndef LGEN_BOTS_XRZBOT
 #define LGEN_BOTS_XRZBOT
 
-#include <random>
-#include <vector>
+#include <array>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <string>
 
+#include "bots/generated/xrzRlWeightsDuel.h"
+#include "bots/generated/xrzRlWeightsFfa.h"
+#include "bots/xrzPolicy.h"
 #include "core/bot.h"
 #include "core/game.hpp"
 
 class XrzBot : public BasicBot {
    private:
-    constexpr static Coord delta[] = {{0, 0}, {-1, 0}, {0, -1}, {1, 0}, {0, 1}};
+    static_assert(
+        xrz_rl_duel_model::kInputSize <= xrz_policy::kFeatureCount &&
+            xrz_rl_ffa_model::kInputSize <= xrz_policy::kFeatureCount,
+        "exported RL weights expect more features than xrzPolicy provides");
 
-    std::mt19937 mtrd{std::random_device{}()};
+    xrz_policy::PolicyState state;
+    std::unique_ptr<BasicBot> delegate;
+    std::optional<GameConstantsPack> gameConstants;
+    index_t playerId = -1;
 
-    pos_t height, width, W;
-    index_t playerCnt;
-    index_t id, team;
-    std::vector<index_t> teamIds;
-    config::Config config;
+    static double relu(double value) { return value > 0.0 ? value : 0.0; }
 
-    BoardView board;
-    std::vector<RankItem> rank;
-
-    Coord previousPos;
-    Coord currentPos;
-    std::vector<int> visitTime;
-    int turnCount;
-    army_t armyNow;
-
-    inline size_t idx(pos_t x, pos_t y) const {
-        return static_cast<size_t>(x * W + y);
+    static std::string choosePersistentDelegateName(
+        const GameConstantsPack& constants) {
+        if (constants.playerCount <= 2) return "KutuBot";
+        if (constants.playerCount >= 6) return "GcBot";
+        return "XiaruizeBot";
     }
 
-    Coord findMaxArmyPos() {
-        army_t maxArmy = 0;
-        Coord maxCoo = Coord(1, 1);
-        for (pos_t i = 1; i <= height; ++i) {
-            for (pos_t j = 1; j <= width; ++j) {
-                if (board.tileAt(i, j).visible &&
-                    board.tileAt(i, j).occupier == id) {
-                    if (board.tileAt(i, j).army > maxArmy) {
-                        maxArmy = board.tileAt(i, j).army;
-                        maxCoo = Coord(i, j);
-                    }
-                }
+    template <std::size_t InputSize>
+    std::array<double, InputSize> adaptFeatures(
+        const std::array<double, xrz_policy::kFeatureCount>& features) const {
+        std::array<double, InputSize> adapted{};
+        for (std::size_t i = 0; i < adapted.size(); ++i) adapted[i] = features[i];
+        return adapted;
+    }
+
+    template <std::size_t InputSize, std::size_t Hidden1Size,
+              std::size_t Hidden2Size>
+    double evaluatePolicyModel(
+        const std::array<double, InputSize>& features,
+        const std::array<double, InputSize * Hidden1Size>& layer1Weights,
+        const std::array<double, Hidden1Size>& layer1Bias,
+        const std::array<double, Hidden1Size * Hidden2Size>& layer2Weights,
+        const std::array<double, Hidden2Size>& layer2Bias,
+        const std::array<double, Hidden2Size>& outputWeights,
+        const std::array<double, 1>& outputBias) const {
+        std::array<double, Hidden1Size> hidden1{};
+        for (std::size_t outIndex = 0; outIndex < Hidden1Size;
+             ++outIndex) {
+            double sum = layer1Bias[outIndex];
+            for (std::size_t inIndex = 0; inIndex < InputSize;
+                 ++inIndex) {
+                sum += layer1Weights[outIndex * InputSize + inIndex] *
+                       features[inIndex];
+            }
+            hidden1[outIndex] = relu(sum);
+        }
+
+        std::array<double, Hidden2Size> hidden2{};
+        for (std::size_t outIndex = 0; outIndex < Hidden2Size;
+             ++outIndex) {
+            double sum = layer2Bias[outIndex];
+            for (std::size_t inIndex = 0; inIndex < Hidden1Size;
+                 ++inIndex) {
+                sum += layer2Weights[outIndex * Hidden1Size + inIndex] *
+                       hidden1[inIndex];
+            }
+            hidden2[outIndex] = relu(sum);
+        }
+
+        double output = outputBias[0];
+        for (std::size_t index = 0; index < Hidden2Size; ++index) {
+            output += outputWeights[index] * hidden2[index];
+        }
+        return output;
+    }
+
+    double evaluateDuelPolicy(
+        const std::array<double, xrz_rl_duel_model::kInputSize>& features) const {
+        return evaluatePolicyModel(
+            features, xrz_rl_duel_model::kLayer1Weights,
+            xrz_rl_duel_model::kLayer1Bias, xrz_rl_duel_model::kLayer2Weights,
+            xrz_rl_duel_model::kLayer2Bias, xrz_rl_duel_model::kOutputWeights,
+            xrz_rl_duel_model::kOutputBias);
+    }
+
+    double evaluateFfaPolicy(
+        const std::array<double, xrz_rl_ffa_model::kInputSize>& features) const {
+        return evaluatePolicyModel(
+            features, xrz_rl_ffa_model::kLayer1Weights,
+            xrz_rl_ffa_model::kLayer1Bias, xrz_rl_ffa_model::kLayer2Weights,
+            xrz_rl_ffa_model::kLayer2Bias, xrz_rl_ffa_model::kOutputWeights,
+            xrz_rl_ffa_model::kOutputBias);
+    }
+
+    double evaluateCandidate(const xrz_policy::CandidateAction& action) const {
+        const bool useFfaModel = state.activePlayerCount() > 2;
+        double score = useFfaModel
+                           ? evaluateFfaPolicy(
+                                 adaptFeatures<xrz_rl_ffa_model::kInputSize>(
+                                     action.features))
+                           : evaluateDuelPolicy(
+                                 adaptFeatures<xrz_rl_duel_model::kInputSize>(
+                                     action.features));
+        score += 0.035 * action.heuristicScore;
+        score += 0.012 * action.sourceScore;
+        return score;
+    }
+
+    std::optional<Move> chooseModelMove() const {
+        const auto actions = state.enumerateCandidateActions();
+        double bestScore = xrz_policy::kNegativeInfinity;
+        std::optional<Move> bestMove;
+
+        for (const xrz_policy::CandidateAction& action : actions) {
+            if (!action.legal) continue;
+            const double score = evaluateCandidate(action);
+            if (!bestMove || score > bestScore) {
+                bestScore = score;
+                bestMove = action.move;
             }
         }
-        return maxCoo;
+
+        return bestMove;
+    }
+
+    std::optional<Move> chooseFallbackMove() const {
+        const auto actions = state.enumerateCandidateActions();
+        double bestScore = xrz_policy::kNegativeInfinity;
+        std::optional<Move> bestMove;
+
+        for (const xrz_policy::CandidateAction& action : actions) {
+            if (!action.legal) continue;
+            const double score = action.heuristicScore + 0.02 * action.sourceScore;
+            if (!bestMove || score > bestScore) {
+                bestScore = score;
+                bestMove = action.move;
+            }
+        }
+
+        return bestMove;
     }
 
    public:
     void init(index_t playerId, const GameConstantsPack& constants) override {
-        id = playerId;
-        height = constants.mapHeight;
-        width = constants.mapWidth;
-        W = width + 2;
-        playerCnt = constants.playerCount;
-        teamIds = constants.teams;
-        team = constants.teams.at(playerId);
-        config = constants.config;
+        this->playerId = playerId;
+        gameConstants = constants;
+        state.init(playerId, constants);
 
-        previousPos = Coord(-1, -1);
-        currentPos = Coord(-1, -1);
-        visitTime.assign((height + 2) * W, 0);
-        turnCount = 0;
-        armyNow = 0;
+        delegate.reset();
+        const std::string delegateName = choosePersistentDelegateName(constants);
+        if (!delegateName.empty()) {
+            delegate.reset(BotFactory::instance().create(delegateName));
+            if (delegate) delegate->init(playerId, constants);
+        }
     }
 
     void requestMove(const BoardView& boardView,
-                     const std::vector<RankItem>& _rank) override {
-        board = boardView;
-        rank = _rank;
-
+                     const std::vector<RankItem>& rank) override {
         moveQueue.clear();
 
-        if (currentPos == Coord(-1, -1) || board.tileAt(currentPos).army == 0 ||
-            board.tileAt(currentPos).occupier != id) {
-            std::fill(visitTime.begin(), visitTime.end(), 0);
-            currentPos = findMaxArmyPos();
+        if (delegate) {
+            delegate->requestMove(boardView, rank);
+            const Move delegatedMove = delegate->step();
+            if (delegatedMove.type != MoveType::EMPTY) {
+                moveQueue.push_back(delegatedMove);
+            }
+            return;
         }
 
-        armyNow = board.tileAt(currentPos).army;
-        turnCount++;
-        visitTime[idx(currentPos.x, currentPos.y)]++;
+        state.observe(boardView, rank);
 
-        int checkOrder[5] = {0, 1, 2, 3, 4};
-        std::shuffle(checkOrder + 1, checkOrder + 5, mtrd);
+        std::optional<Move> selectedMove = chooseModelMove();
+        if (!selectedMove) selectedMove = chooseFallbackMove();
+        if (!selectedMove) return;
 
-        int okDir = 0;
-        for (int j = 1; j <= 4; ++j) {
-            int i = checkOrder[j];
-            Coord next = currentPos + delta[i];
-            if (next.x < 1 || next.x > height || next.y < 1 || next.y > width)
-                continue;
-            if (isImpassableTile(board.tileAt(next).type)) continue;
-            okDir = i;
+        state.commitSelectedMove(*selectedMove);
+        moveQueue.push_back(*selectedMove);
+    }
 
-            if (board.tileAt(next).occupier != id &&
-                board.tileAt(next).type == TILE_GENERAL) {
-                previousPos = currentPos;
-                currentPos = next;
-                moveQueue.emplace_back(MoveType::MOVE_ARMY, previousPos, next,
-                                       false);
-                return;
-            }
-            if (board.tileAt(next).type == TILE_CITY &&
-                board.tileAt(next).army <= board.tileAt(currentPos).army &&
-                board.tileAt(next).occupier != id) {
-                previousPos = currentPos;
-                currentPos = next;
-                moveQueue.emplace_back(MoveType::MOVE_ARMY, previousPos, next,
-                                       false);
-                return;
-            }
-        }
-
-        int timeToTry = 1000;
-        while (timeToTry--) {
-            int i = (mtrd() % 4 + mtrd() % 4 + mtrd() % 4) % 4 + 1;
-            Coord next = currentPos + delta[i];
-            if (next.x < 1 || next.x > height || next.y < 1 || next.y > width)
-                continue;
-            if (isImpassableTile(board.tileAt(next).type)) continue;
-
-            if (board.tileAt(next).occupier != id &&
-                board.tileAt(next).type == TILE_GENERAL) {
-                previousPos = currentPos;
-                currentPos = next;
-                moveQueue.emplace_back(MoveType::MOVE_ARMY, previousPos, next,
-                                       false);
-                return;
-            }
-            if (board.tileAt(next).type == TILE_CITY &&
-                board.tileAt(next).army <= board.tileAt(currentPos).army &&
-                board.tileAt(next).occupier == -1) {
-                previousPos = currentPos;
-                currentPos = next;
-                moveQueue.emplace_back(MoveType::MOVE_ARMY, previousPos, next,
-                                       false);
-                return;
-            }
-
-            int cnt = 4;
-            if (next.x == previousPos.x && next.y == previousPos.y)
-                cnt += turnCount * 10;
-            if (board.tileAt(next).occupier != id &&
-                board.tileAt(next).occupier != -1)
-                cnt--;
-            if (board.tileAt(next).type == TILE_BLANK) cnt--;
-            if (board.tileAt(next).type == TILE_SWAMP) cnt += 2;
-            if (board.tileAt(next).occupier == -1) cnt--;
-            if (board.tileAt(next).occupier == id &&
-                board.tileAt(next).army >= 2000)
-                cnt--;
-            cnt += std::max(0, visitTime[idx(next.x, next.y)] * 10);
-
-            if (mtrd() % cnt == 0) {
-                previousPos = currentPos;
-                currentPos = next;
-                moveQueue.emplace_back(MoveType::MOVE_ARMY, previousPos, next,
-                                       false);
-                return;
-            }
-        }
-
-        if (okDir != 0) {
-            Coord next = currentPos + delta[okDir];
-            previousPos = currentPos;
-            currentPos = next;
-            moveQueue.emplace_back(MoveType::MOVE_ARMY, previousPos, next,
-                                   false);
-        }
+    void onGameEvent(const GameEvent& event) override {
+        if (delegate) delegate->onGameEvent(event);
     }
 };
 
