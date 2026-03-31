@@ -45,7 +45,8 @@ class XrzBot : public BasicBot {
     std::array<double, InputSize> adaptFeatures(
         const std::array<double, xrz_policy::kFeatureCount>& features) const {
         std::array<double, InputSize> adapted{};
-        for (std::size_t i = 0; i < adapted.size(); ++i) adapted[i] = features[i];
+        for (std::size_t i = 0; i < adapted.size(); ++i)
+            adapted[i] = features[i];
         return adapted;
     }
 
@@ -60,11 +61,9 @@ class XrzBot : public BasicBot {
         const std::array<double, Hidden2Size>& outputWeights,
         const std::array<double, 1>& outputBias) const {
         std::array<double, Hidden1Size> hidden1{};
-        for (std::size_t outIndex = 0; outIndex < Hidden1Size;
-             ++outIndex) {
+        for (std::size_t outIndex = 0; outIndex < Hidden1Size; ++outIndex) {
             double sum = layer1Bias[outIndex];
-            for (std::size_t inIndex = 0; inIndex < InputSize;
-                 ++inIndex) {
+            for (std::size_t inIndex = 0; inIndex < InputSize; ++inIndex) {
                 sum += layer1Weights[outIndex * InputSize + inIndex] *
                        features[inIndex];
             }
@@ -72,11 +71,9 @@ class XrzBot : public BasicBot {
         }
 
         std::array<double, Hidden2Size> hidden2{};
-        for (std::size_t outIndex = 0; outIndex < Hidden2Size;
-             ++outIndex) {
+        for (std::size_t outIndex = 0; outIndex < Hidden2Size; ++outIndex) {
             double sum = layer2Bias[outIndex];
-            for (std::size_t inIndex = 0; inIndex < Hidden1Size;
-                 ++inIndex) {
+            for (std::size_t inIndex = 0; inIndex < Hidden1Size; ++inIndex) {
                 sum += layer2Weights[outIndex * Hidden1Size + inIndex] *
                        hidden1[inIndex];
             }
@@ -91,7 +88,8 @@ class XrzBot : public BasicBot {
     }
 
     double evaluateDuelPolicy(
-        const std::array<double, xrz_rl_duel_model::kInputSize>& features) const {
+        const std::array<double, xrz_rl_duel_model::kInputSize>& features)
+        const {
         return evaluatePolicyModel(
             features, xrz_rl_duel_model::kLayer1Weights,
             xrz_rl_duel_model::kLayer1Bias, xrz_rl_duel_model::kLayer2Weights,
@@ -100,7 +98,8 @@ class XrzBot : public BasicBot {
     }
 
     double evaluateFfaPolicy(
-        const std::array<double, xrz_rl_ffa_model::kInputSize>& features) const {
+        const std::array<double, xrz_rl_ffa_model::kInputSize>& features)
+        const {
         return evaluatePolicyModel(
             features, xrz_rl_ffa_model::kLayer1Weights,
             xrz_rl_ffa_model::kLayer1Bias, xrz_rl_ffa_model::kLayer2Weights,
@@ -110,13 +109,13 @@ class XrzBot : public BasicBot {
 
     double evaluateCandidate(const xrz_policy::CandidateAction& action) const {
         const bool useFfaModel = state.activePlayerCount() > 2;
-        double score = useFfaModel
-                           ? evaluateFfaPolicy(
-                                 adaptFeatures<xrz_rl_ffa_model::kInputSize>(
-                                     action.features))
-                           : evaluateDuelPolicy(
-                                 adaptFeatures<xrz_rl_duel_model::kInputSize>(
-                                     action.features));
+        double score =
+            useFfaModel
+                ? evaluateFfaPolicy(adaptFeatures<xrz_rl_ffa_model::kInputSize>(
+                      action.features))
+                : evaluateDuelPolicy(
+                      adaptFeatures<xrz_rl_duel_model::kInputSize>(
+                          action.features));
         score += 0.035 * action.heuristicScore;
         score += 0.012 * action.sourceScore;
         return score;
@@ -146,7 +145,8 @@ class XrzBot : public BasicBot {
 
         for (const xrz_policy::CandidateAction& action : actions) {
             if (!action.legal) continue;
-            const double score = action.heuristicScore + 0.02 * action.sourceScore;
+            const double score =
+                action.heuristicScore + 0.02 * action.sourceScore;
             if (!bestMove || score > bestScore) {
                 bestScore = score;
                 bestMove = action.move;
@@ -163,7 +163,8 @@ class XrzBot : public BasicBot {
         state.init(playerId, constants);
 
         delegate.reset();
-        const std::string delegateName = choosePersistentDelegateName(constants);
+        const std::string delegateName =
+            choosePersistentDelegateName(constants);
         if (!delegateName.empty()) {
             delegate.reset(BotFactory::instance().create(delegateName));
             if (delegate) delegate->init(playerId, constants);

@@ -83,7 +83,8 @@ class PolicyState {
 
     index_t activePlayerCount() const { return playerCount; }
 
-    void observe(const BoardView& boardView, const std::vector<RankItem>& rank) {
+    void observe(const BoardView& boardView,
+                 const std::vector<RankItem>& rank) {
         board = boardView;
         ++halfTurnCount;
         syncRank(rank);
@@ -119,14 +120,13 @@ class PolicyState {
              ++sourceSlot) {
             const Coord source = sources[sourceSlot];
             const double score = sourceScore(source);
-            for (std::size_t directionIndex = 0; directionIndex < kDirectionCount;
-                 ++directionIndex) {
+            for (std::size_t directionIndex = 0;
+                 directionIndex < kDirectionCount; ++directionIndex) {
                 for (std::size_t splitIndex = 0; splitIndex < kSplitModeCount;
                      ++splitIndex) {
                     const bool takeHalf = splitIndex == 1;
-                    result.push_back(makeCandidate(sourceSlot, source,
-                                                   directionIndex, takeHalf,
-                                                   score));
+                    result.push_back(makeCandidate(
+                        sourceSlot, source, directionIndex, takeHalf, score));
                 }
             }
         }
@@ -134,20 +134,21 @@ class PolicyState {
         return result;
     }
 
-    std::array<CandidateAction, kDatasetActionCount> enumerateFixedCandidateActions()
-        const {
+    std::array<CandidateAction, kDatasetActionCount>
+    enumerateFixedCandidateActions() const {
         std::array<CandidateAction, kDatasetActionCount> actions{};
-        const std::vector<Coord> sources = candidateSources(kCandidateSourceCount);
+        const std::vector<Coord> sources =
+            candidateSources(kCandidateSourceCount);
 
         for (std::size_t sourceSlot = 0; sourceSlot < kCandidateSourceCount;
              ++sourceSlot) {
             const bool sourceExists = sourceSlot < sources.size();
-            const Coord source = sourceExists ? sources[sourceSlot]
-                                              : Coord{-1, -1};
-            const double score = sourceExists ? sourceScore(source)
-                                              : kNegativeInfinity;
-            for (std::size_t directionIndex = 0; directionIndex < kDirectionCount;
-                 ++directionIndex) {
+            const Coord source =
+                sourceExists ? sources[sourceSlot] : Coord{-1, -1};
+            const double score =
+                sourceExists ? sourceScore(source) : kNegativeInfinity;
+            for (std::size_t directionIndex = 0;
+                 directionIndex < kDirectionCount; ++directionIndex) {
                 for (std::size_t splitIndex = 0; splitIndex < kSplitModeCount;
                      ++splitIndex) {
                     const std::size_t actionIndex =
@@ -161,9 +162,9 @@ class PolicyState {
                         actions[actionIndex] = placeholder;
                         continue;
                     }
-                    actions[actionIndex] = makeCandidate(
-                        sourceSlot, source, directionIndex, splitIndex == 1,
-                        score);
+                    actions[actionIndex] =
+                        makeCandidate(sourceSlot, source, directionIndex,
+                                      splitIndex == 1, score);
                 }
             }
         }
@@ -239,12 +240,13 @@ class PolicyState {
         const army_t remainingArmy = sourceTile.army - movedArmy;
 
         double score = 0.0;
-        if (targetType == TILE_GENERAL && isEnemy(targetOccupier)) score += 1500.0;
-        if (targetType == TILE_CITY && !isFriendly(targetOccupier)) score += 180.0;
+        if (targetType == TILE_GENERAL && isEnemy(targetOccupier))
+            score += 1500.0;
+        if (targetType == TILE_CITY && !isFriendly(targetOccupier))
+            score += 180.0;
         if (isEnemy(targetOccupier)) {
             score += 70.0;
-            score += std::max(0.0,
-                              static_cast<double>(movedArmy - targetArmy));
+            score += std::max(0.0, static_cast<double>(movedArmy - targetArmy));
         } else if (targetOccupier == -1) {
             score += 18.0;
         } else {
@@ -262,8 +264,8 @@ class PolicyState {
 
         if (const auto closestEnemyGeneral = nearestKnownEnemyGeneral(source)) {
             const int sourceDist = *closestEnemyGeneral;
-            const int targetDist = distanceToClosestKnownEnemyGeneral(target)
-                                       .value_or(sourceDist);
+            const int targetDist =
+                distanceToClosestKnownEnemyGeneral(target).value_or(sourceDist);
             score += static_cast<double>(sourceDist - targetDist) * 6.5;
         }
 
@@ -296,8 +298,8 @@ class PolicyState {
 
     static double normalizedDistanceCloseness(int distance, int maxDistance) {
         if (distance < 0 || maxDistance <= 0) return 0.0;
-        const double clamped =
-            std::min(static_cast<double>(distance), static_cast<double>(maxDistance));
+        const double clamped = std::min(static_cast<double>(distance),
+                                        static_cast<double>(maxDistance));
         return 1.0 - clamped / static_cast<double>(maxDistance);
     }
 
@@ -346,7 +348,8 @@ class PolicyState {
 
     void updateMemory() {
         for (index_t player = 0; player < playerCount; ++player) {
-            if (!rankById.empty() && player < static_cast<index_t>(rankById.size()) &&
+            if (!rankById.empty() &&
+                player < static_cast<index_t>(rankById.size()) &&
                 !rankById[player].alive) {
                 knownGenerals[player] = Coord{-1, -1};
             }
@@ -368,7 +371,8 @@ class PolicyState {
 
                 for (index_t player = 0; player < playerCount; ++player) {
                     if (knownGenerals[player] == coord &&
-                        (tile.type != TILE_GENERAL || tile.occupier != player)) {
+                        (tile.type != TILE_GENERAL ||
+                         tile.occupier != player)) {
                         knownGenerals[player] = Coord{-1, -1};
                     }
                 }
@@ -440,9 +444,8 @@ class PolicyState {
             if (!inside(target)) continue;
             const index_t occupier = occupierAt(target);
             if (!isEnemy(occupier)) continue;
-            pressure = std::max(
-                pressure,
-                static_cast<int>(std::max<army_t>(0, armyAt(target) - sourceArmy)));
+            pressure = std::max(pressure, static_cast<int>(std::max<army_t>(
+                                              0, armyAt(target) - sourceArmy)));
         }
         return pressure;
     }
@@ -495,7 +498,8 @@ class PolicyState {
         action.sourceScore = score;
         action.target = source + kDirs[directionIndex];
         action.legal = isLegalMove(source, action.target);
-        action.move = Move(MoveType::MOVE_ARMY, source, action.target, takeHalf);
+        action.move =
+            Move(MoveType::MOVE_ARMY, source, action.target, takeHalf);
         action.features = buildFeatures(source, directionIndex, takeHalf);
         action.heuristicScore = heuristicPrior(source, action.target, takeHalf);
         return action;
@@ -518,8 +522,7 @@ class PolicyState {
         }
 
         std::stable_sort(scored.begin(), scored.end(),
-                         [](const ScoredSource& lhs,
-                            const ScoredSource& rhs) {
+                         [](const ScoredSource& lhs, const ScoredSource& rhs) {
                              return lhs.score > rhs.score;
                          });
         if (scored.size() > limit) scored.resize(limit);
@@ -547,21 +550,20 @@ class PolicyState {
         const int sourceVisitCount = visitTime[idx(source)];
         const army_t movedArmy = movedArmyFor(sourceTile.army, takeHalf);
         const army_t remainingArmy = sourceTile.army - movedArmy;
-        const auto sourceGeneralDistance = distanceToClosestKnownEnemyGeneral(source);
+        const auto sourceGeneralDistance =
+            distanceToClosestKnownEnemyGeneral(source);
         const auto targetGeneralDistance =
             targetInBounds ? distanceToClosestKnownEnemyGeneral(target)
                            : std::nullopt;
         const bool knownEnemyGeneral = sourceGeneralDistance.has_value();
-        const double sourceEnemyGeneralCloseness = sourceGeneralDistance
-                                                      ? normalizedDistanceCloseness(
-                                                            *sourceGeneralDistance,
-                                                            height + width)
-                                                      : 0.0;
-        const double targetEnemyGeneralCloseness = targetGeneralDistance
-                                                      ? normalizedDistanceCloseness(
-                                                            *targetGeneralDistance,
-                                                            height + width)
-                                                      : 0.0;
+        const double sourceEnemyGeneralCloseness =
+            sourceGeneralDistance ? normalizedDistanceCloseness(
+                                        *sourceGeneralDistance, height + width)
+                                  : 0.0;
+        const double targetEnemyGeneralCloseness =
+            targetGeneralDistance ? normalizedDistanceCloseness(
+                                        *targetGeneralDistance, height + width)
+                                  : 0.0;
 
         features[0] = 1.0;
         features[1] = scale(static_cast<double>(sourceTile.army), 64.0);
@@ -599,7 +601,8 @@ class PolicyState {
                 isImpassableTile(targetType) || targetType == TILE_OBSTACLE;
             const auto [enemyNeighbors, friendlyNeighbors] =
                 neighborCounts(target);
-            const bool reverseMove = source == lastMoveTo && target == lastMoveFrom;
+            const bool reverseMove =
+                source == lastMoveTo && target == lastMoveFrom;
 
             features[13] = targetFriendly ? 1.0 : 0.0;
             features[14] = targetEnemy ? 1.0 : 0.0;
@@ -609,9 +612,11 @@ class PolicyState {
             features[18] = targetType == TILE_SWAMP ? 1.0 : 0.0;
             features[19] = targetObstacle ? 1.0 : 0.0;
             features[20] = scale(static_cast<double>(targetArmy), 64.0);
-            features[21] = scale(static_cast<double>(movedArmy - targetArmy), 32.0);
+            features[21] =
+                scale(static_cast<double>(movedArmy - targetArmy), 32.0);
             features[22] = reverseMove ? 1.0 : 0.0;
-            features[23] = scale(static_cast<double>(visitTime[idx(target)]), 16.0);
+            features[23] =
+                scale(static_cast<double>(visitTime[idx(target)]), 16.0);
             features[26] = scale(static_cast<double>(enemyNeighbors), 4.0);
             features[27] = scale(static_cast<double>(friendlyNeighbors), 4.0);
             features[29] = isEdge(target) ? 1.0 : 0.0;

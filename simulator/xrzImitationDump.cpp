@@ -61,8 +61,7 @@ struct Options {
     bool remainIndex = true;
     std::string outputPath = "rl/datasets/xrz_imitation.jsonl";
     std::vector<std::string> teachers = {"XiaruizeBot"};
-    std::vector<std::string> opponents = {"GcBot", "SmartRandomBot",
-                                          "oimbot"};
+    std::vector<std::string> opponents = {"GcBot", "SmartRandomBot", "oimbot"};
     std::vector<BoardSize> randomBoardSizes;
     std::vector<std::string> mapPaths;
     std::vector<LoadedBoard> customBoards;
@@ -117,26 +116,32 @@ void printUsage() {
         << "  --games N            Number of games to dump (default: 64)\n"
         << "  --width N            Random map width (default: 18)\n"
         << "  --height N           Random map height (default: 18)\n"
-        << "  --steps N            Maximum half-turn steps per game (default: 600)\n"
+        << "  --steps N            Maximum half-turn steps per game (default: "
+           "600)\n"
         << "  --threads N          CPU worker threads (default: auto)\n"
-        << "  --players N          Total players per game including the teacher (default: 2)\n"
-        << "  --teacher NAME       Teacher bot name (single-teacher compatibility mode)\n"
+        << "  --players N          Total players per game including the "
+           "teacher (default: 2)\n"
+        << "  --teacher NAME       Teacher bot name (single-teacher "
+           "compatibility mode)\n"
         << "  --teachers A B ...   Teacher bot pool\n"
-        << "  --output PATH        JSONL output path (default: rl/datasets/xrz_imitation.jsonl)\n"
+        << "  --output PATH        JSONL output path (default: "
+           "rl/datasets/xrz_imitation.jsonl)\n"
         << "  --size WxH           Add a random-map size to the rotation\n"
-        << "  --sizes A B ...      Replace the random-map rotation with explicit sizes\n"
+        << "  --sizes A B ...      Replace the random-map rotation with "
+           "explicit sizes\n"
         << "  --map PATH           Add a custom .lgmp map to the rotation\n"
-        << "  --maps A B ...       Replace the custom-map rotation with explicit paths\n"
+        << "  --maps A B ...       Replace the custom-map rotation with "
+           "explicit paths\n"
         << "  --shuffle            Randomize player index mapping\n"
-        << "  --opponents A B ...  Opponent pool (default: GcBot SmartRandomBot oimbot)\n";
+        << "  --opponents A B ...  Opponent pool (default: GcBot "
+           "SmartRandomBot oimbot)\n";
 }
 
 bool parseArgs(int argc, char** argv, Options& options) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--games" || arg == "--width" || arg == "--height" ||
-            arg == "--players" ||
-            arg == "--steps" || arg == "--threads") {
+            arg == "--players" || arg == "--steps" || arg == "--threads") {
             if (i + 1 >= argc) return false;
             int value = 0;
             if (!parsePositiveInt(argv[++i], value)) return false;
@@ -220,8 +225,8 @@ int detectWorkerCount(const Options& options) {
 }
 
 std::string serializeSample(
-    const std::array<xrz_policy::CandidateAction, xrz_policy::kDatasetActionCount>&
-        actions,
+    const std::array<xrz_policy::CandidateAction,
+                     xrz_policy::kDatasetActionCount>& actions,
     std::size_t label) {
     std::ostringstream out;
     out << std::fixed << std::setprecision(6);
@@ -289,10 +294,13 @@ class RecordingTeacherBot : public BasicBot {
             state.commitSelectedMove(teacherMove);
         }
 
-        if (teacherMove.type != MoveType::EMPTY) moveQueue.push_back(teacherMove);
+        if (teacherMove.type != MoveType::EMPTY)
+            moveQueue.push_back(teacherMove);
     }
 
-    void onGameEvent(const GameEvent& event) override { inner->onGameEvent(event); }
+    void onGameEvent(const GameEvent& event) override {
+        inner->onGameEvent(event);
+    }
 
    private:
     std::string teacherName;
@@ -316,8 +324,8 @@ bool loadCustomMap(const std::string& mapPath, LoadedBoard& board,
         extension.begin(), extension.end(), extension.begin(),
         [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     if (extension != ".lgmp") {
-        errorMessage = "Only v6 .lgmp maps are supported by --map/--maps: " +
-                       mapPath;
+        errorMessage =
+            "Only v6 .lgmp maps are supported by --map/--maps: " + mapPath;
         return false;
     }
 
@@ -325,8 +333,8 @@ bool loadCustomMap(const std::string& mapPath, LoadedBoard& board,
     const MapDocument document =
         openMap_v6(QString::fromStdString(mapPath), qtErrorMessage);
     if (!qtErrorMessage.isEmpty()) {
-        errorMessage = "Failed to load map '" + mapPath + "': " +
-                       qtErrorMessage.toStdString();
+        errorMessage = "Failed to load map '" + mapPath +
+                       "': " + qtErrorMessage.toStdString();
         return false;
     }
 
@@ -412,7 +420,8 @@ GameSetup selectGameSetup(const Options& options, int gameNumber) {
         return setup;
     }
 
-    std::uniform_int_distribution<std::size_t> boardDist(0, totalBoardCount - 1);
+    std::uniform_int_distribution<std::size_t> boardDist(0,
+                                                         totalBoardCount - 1);
     const std::size_t boardIndex = boardDist(rng);
     if (boardIndex < randomBoardCount) {
         const BoardSize& boardSize = options.randomBoardSizes[boardIndex];
@@ -442,14 +451,15 @@ GameResult runSingleGame(const Options& options, int gameNumber,
     teams.reserve(options.playerCount);
     names.reserve(options.playerCount);
 
-    players.push_back(
-        new RecordingTeacherBot(setup.teacher.botName, output, outputMutex, stats));
+    players.push_back(new RecordingTeacherBot(setup.teacher.botName, output,
+                                              outputMutex, stats));
     teams.push_back(0);
     names.push_back(setup.teacher.displayName);
 
     for (std::size_t index = 0; index < setup.opponents.size(); ++index) {
         const SelectedBot& opponentSpec = setup.opponents[index];
-        BasicBot* opponent = BotFactory::instance().create(opponentSpec.botName);
+        BasicBot* opponent =
+            BotFactory::instance().create(opponentSpec.botName);
         if (!opponent) {
             for (Player* player : players) delete player;
             throw std::runtime_error("Failed to create opponent bot: " +
@@ -464,9 +474,8 @@ GameResult runSingleGame(const Options& options, int gameNumber,
     const int initResult = game.init();
     if (initResult != 0) {
         std::ostringstream err;
-        err << "Failed to initialize game " << gameNumber
-            << " on " << setup.boardLabel << " (spawn error code " << initResult
-            << ')';
+        err << "Failed to initialize game " << gameNumber << " on "
+            << setup.boardLabel << " (spawn error code " << initResult << ')';
         throw std::runtime_error(err.str());
     }
 
@@ -524,7 +533,8 @@ int main(int argc, char** argv) {
     }
     std::ofstream output(outputPath, std::ios::out | std::ios::trunc);
     if (!output.is_open()) {
-        std::cerr << "Failed to open output file: " << options.outputPath << '\n';
+        std::cerr << "Failed to open output file: " << options.outputPath
+                  << '\n';
         return 5;
     }
 
@@ -563,8 +573,8 @@ int main(int argc, char** argv) {
             const int gameNumber = nextGame.fetch_add(1);
             if (gameNumber > options.games) return;
             try {
-                const GameResult result = runSingleGame(options, gameNumber, &output,
-                                                        &outputMutex, &stats);
+                const GameResult result = runSingleGame(
+                    options, gameNumber, &output, &outputMutex, &stats);
                 if (result.winnerName == result.teacherDisplayName) {
                     stats.teacherWins.fetch_add(1);
                 }
@@ -607,9 +617,8 @@ int main(int argc, char** argv) {
               << "Teacher-side wins: " << stats.teacherWins.load() << "/"
               << options.games << "\n"
               << "Samples recorded: " << stats.samplesRecorded.load() << "/"
-              << stats.samplesConsidered.load() << " (coverage "
-              << std::fixed << std::setprecision(2) << coverage * 100.0
-              << "%)\n"
+              << stats.samplesConsidered.load() << " (coverage " << std::fixed
+              << std::setprecision(2) << coverage * 100.0 << "%)\n"
               << "Samples outside candidate set: "
               << stats.samplesOutOfSet.load() << std::endl;
 
