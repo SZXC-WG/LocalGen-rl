@@ -83,6 +83,26 @@ class PolicyState {
 
     index_t activePlayerCount() const { return playerCount; }
 
+    int observedHalfTurnCount() const { return halfTurnCount; }
+
+    pos_t mapHeight() const { return height; }
+
+    pos_t mapWidth() const { return width; }
+
+    bool insideMap(Coord coord) const { return inside(coord); }
+
+    tile_type_e observedTerrainAt(Coord coord) const { return terrainAt(coord); }
+
+    index_t observedOccupierAt(Coord coord) const { return occupierAt(coord); }
+
+    army_t observedArmyAt(Coord coord) const { return armyAt(coord); }
+
+    bool isFriendlyOccupier(index_t occupier) const {
+        return isFriendly(occupier);
+    }
+
+    bool isEnemyOccupier(index_t occupier) const { return isEnemy(occupier); }
+
     void observe(const BoardView& boardView,
                  const std::vector<RankItem>& rank) {
         board = boardView;

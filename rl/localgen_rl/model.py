@@ -12,8 +12,8 @@ class ActionValueNet(nn.Module):
     def __init__(
         self,
         input_dim: int = INPUT_FEATURE_COUNT,
-        hidden1_size: int = 64,
-        hidden2_size: int = 32,
+        hidden1_size: int = 96,
+        hidden2_size: int = 48,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim

@@ -10,9 +10,10 @@
 
 #include <array>
 #include <cstddef>
-#include <memory>
+#include <deque>
+#include <limits>
 #include <optional>
-#include <string>
+#include <vector>
 
 #include "bots/generated/xrzRlWeightsDuel.h"
 #include "bots/generated/xrzRlWeightsFfa.h"
@@ -22,24 +23,25 @@
 
 class XrzBot : public BasicBot {
    private:
+    static constexpr std::size_t kRuntimeDuelSourceCount = 32;
+    static constexpr std::size_t kRuntimeFfaSourceCount = 48;
+    static constexpr int kUnreachableDistance = 1'000'000;
+
     static_assert(
         xrz_rl_duel_model::kInputSize <= xrz_policy::kFeatureCount &&
             xrz_rl_ffa_model::kInputSize <= xrz_policy::kFeatureCount,
         "exported RL weights expect more features than xrzPolicy provides");
 
+    struct StrategicMaps {
+        std::vector<int> enemyGeneralDistances;
+        std::vector<int> cityDistances;
+        std::vector<int> enemyDistances;
+        std::vector<int> expansionDistances;
+    };
+
     xrz_policy::PolicyState state;
-    std::unique_ptr<BasicBot> delegate;
-    std::optional<GameConstantsPack> gameConstants;
-    index_t playerId = -1;
 
     static double relu(double value) { return value > 0.0 ? value : 0.0; }
-
-    static std::string choosePersistentDelegateName(
-        const GameConstantsPack& constants) {
-        if (constants.playerCount <= 2) return "KutuBot";
-        if (constants.playerCount >= 6) return "GcBot";
-        return "XiaruizeBot";
-    }
 
     template <std::size_t InputSize>
     std::array<double, InputSize> adaptFeatures(
@@ -107,28 +109,171 @@ class XrzBot : public BasicBot {
             xrz_rl_ffa_model::kOutputBias);
     }
 
-    double evaluateCandidate(const xrz_policy::CandidateAction& action) const {
+    bool isPassableTerrain(tile_type_e terrain) const {
+        return !isImpassableTile(terrain) && terrain != TILE_OBSTACLE;
+    }
+
+    std::size_t cellIndex(Coord coord) const {
+        return static_cast<std::size_t>(coord.x * (state.mapWidth() + 2) +
+                                        coord.y);
+    }
+
+    template <typename Predicate>
+    std::vector<int> buildDistanceMap(Predicate&& isTarget) const {
+        const pos_t height = state.mapHeight();
+        const pos_t width = state.mapWidth();
+        const pos_t stride = width + 2;
+        std::vector<int> distances((height + 2) * stride,
+                                   kUnreachableDistance);
+        std::deque<Coord> frontier;
+
+        for (pos_t x = 1; x <= height; ++x) {
+            for (pos_t y = 1; y <= width; ++y) {
+                const Coord coord{x, y};
+                const tile_type_e terrain = state.observedTerrainAt(coord);
+                if (!isPassableTerrain(terrain)) continue;
+                if (!isTarget(coord)) continue;
+                distances[cellIndex(coord)] = 0;
+                frontier.push_back(coord);
+            }
+        }
+
+        while (!frontier.empty()) {
+            const Coord current = frontier.front();
+            frontier.pop_front();
+            const int nextDistance = distances[cellIndex(current)] + 1;
+            for (Coord delta : xrz_policy::kDirs) {
+                const Coord next = current + delta;
+                if (!state.insideMap(next)) continue;
+                if (!isPassableTerrain(state.observedTerrainAt(next))) continue;
+                const std::size_t nextIndex = cellIndex(next);
+                if (nextDistance >= distances[nextIndex]) continue;
+                distances[nextIndex] = nextDistance;
+                frontier.push_back(next);
+            }
+        }
+
+        return distances;
+    }
+
+    StrategicMaps buildStrategicMaps() const {
+        StrategicMaps maps;
+        maps.enemyGeneralDistances = buildDistanceMap([this](Coord coord) {
+            return state.observedTerrainAt(coord) == TILE_GENERAL &&
+                   state.isEnemyOccupier(state.observedOccupierAt(coord));
+        });
+        maps.cityDistances = buildDistanceMap([this](Coord coord) {
+            return state.observedTerrainAt(coord) == TILE_CITY &&
+                   !state.isFriendlyOccupier(state.observedOccupierAt(coord));
+        });
+        maps.enemyDistances = buildDistanceMap([this](Coord coord) {
+            return state.isEnemyOccupier(state.observedOccupierAt(coord));
+        });
+        maps.expansionDistances = buildDistanceMap([this](Coord coord) {
+            const tile_type_e terrain = state.observedTerrainAt(coord);
+            return state.observedOccupierAt(coord) == -1 && terrain != TILE_CITY &&
+                   terrain != TILE_SWAMP;
+        });
+        return maps;
+    }
+
+    double distanceProgressBonus(const std::vector<int>& distances,
+                                 const xrz_policy::CandidateAction& action,
+                                 double stepWeight,
+                                 double arrivalBonus) const {
+        if (distances.empty()) return 0.0;
+        const int fromDistance = distances[cellIndex(action.source)];
+        const int toDistance = distances[cellIndex(action.target)];
+        if (fromDistance >= kUnreachableDistance ||
+            toDistance >= kUnreachableDistance) {
+            return 0.0;
+        }
+
+        double bonus = stepWeight * static_cast<double>(fromDistance - toDistance);
+        if (toDistance == 0 && fromDistance > 0) bonus += arrivalBonus;
+        return bonus;
+    }
+
+    double strategicRouteBonus(const StrategicMaps& maps,
+                               const xrz_policy::CandidateAction& action) const {
+        const int halfTurnCount = state.observedHalfTurnCount();
         const bool useFfaModel = state.activePlayerCount() > 2;
-        double score =
+        double bonus = 0.0;
+
+        bonus += distanceProgressBonus(maps.enemyGeneralDistances, action, 4.0,
+                                       12.0);
+        bonus += distanceProgressBonus(maps.cityDistances, action,
+                                       halfTurnCount <= 120 ? 2.4 : 1.6,
+                                       4.0);
+        bonus += distanceProgressBonus(maps.enemyDistances, action,
+                                       halfTurnCount <= 40 ? 0.5 : 1.4,
+                                       1.5);
+        bonus += distanceProgressBonus(maps.expansionDistances, action,
+                                       halfTurnCount <= 70
+                                           ? (useFfaModel ? 1.6 : 1.2)
+                                           : 0.3,
+                                       0.8);
+        return bonus;
+    }
+
+    double evaluateCandidate(const xrz_policy::CandidateAction& action,
+                             const StrategicMaps& maps) const {
+        const int halfTurnCount = state.observedHalfTurnCount();
+        const bool useFfaModel = state.activePlayerCount() > 2;
+        const double modelScore =
             useFfaModel
                 ? evaluateFfaPolicy(adaptFeatures<xrz_rl_ffa_model::kInputSize>(
                       action.features))
                 : evaluateDuelPolicy(
                       adaptFeatures<xrz_rl_duel_model::kInputSize>(
                           action.features));
-        score += 0.035 * action.heuristicScore;
-        score += 0.012 * action.sourceScore;
+
+        double heuristicWeight = useFfaModel ? 0.050 : 0.040;
+        double sourceWeight = useFfaModel ? 0.018 : 0.014;
+        if (halfTurnCount <= 50) {
+            heuristicWeight += useFfaModel ? 0.018 : 0.014;
+            sourceWeight += 0.006;
+        } else if (halfTurnCount <= 120) {
+            heuristicWeight += 0.006;
+            sourceWeight += 0.004;
+        }
+
+        double score = modelScore;
+        score += heuristicWeight * action.heuristicScore;
+        score += sourceWeight * action.sourceScore;
+        score += strategicRouteBonus(maps, action);
+        if (!action.takeHalf) score += 0.35;
+
+        if (action.features[16] > 0.5 && action.features[14] > 0.5)
+            score += 120.0;
+        else if (action.features[17] > 0.5 && action.features[13] < 0.5)
+            score += 10.0;
+        else if (action.features[14] > 0.5 && action.features[21] > 0.0)
+            score += 2.5;
+
+        if (halfTurnCount <= 60 && action.features[15] > 0.5 &&
+            !action.takeHalf) {
+            score += 2.0;
+        }
+        if (action.features[18] > 0.5) score -= action.takeHalf ? 0.5 : 1.5;
+        if (action.features[22] > 0.5) score -= 1.5;
         return score;
     }
 
-    std::optional<Move> chooseModelMove() const {
-        const auto actions = state.enumerateCandidateActions();
+    std::size_t runtimeSourceLimit() const {
+        return state.activePlayerCount() > 2 ? kRuntimeFfaSourceCount
+                                             : kRuntimeDuelSourceCount;
+    }
+
+    std::optional<Move> chooseModelMove(const StrategicMaps& maps) const {
+        const auto actions =
+            state.enumerateCandidateActions(runtimeSourceLimit());
         double bestScore = xrz_policy::kNegativeInfinity;
         std::optional<Move> bestMove;
 
         for (const xrz_policy::CandidateAction& action : actions) {
             if (!action.legal) continue;
-            const double score = evaluateCandidate(action);
+            const double score = evaluateCandidate(action, maps);
             if (!bestMove || score > bestScore) {
                 bestScore = score;
                 bestMove = action.move;
@@ -138,15 +283,17 @@ class XrzBot : public BasicBot {
         return bestMove;
     }
 
-    std::optional<Move> chooseFallbackMove() const {
-        const auto actions = state.enumerateCandidateActions();
+    std::optional<Move> chooseFallbackMove(const StrategicMaps& maps) const {
+        const auto actions =
+            state.enumerateCandidateActions(runtimeSourceLimit());
         double bestScore = xrz_policy::kNegativeInfinity;
         std::optional<Move> bestMove;
 
         for (const xrz_policy::CandidateAction& action : actions) {
             if (!action.legal) continue;
-            const double score =
-                action.heuristicScore + 0.02 * action.sourceScore;
+            const double score = action.heuristicScore +
+                                 0.02 * action.sourceScore +
+                                 strategicRouteBonus(maps, action);
             if (!bestMove || score > bestScore) {
                 bestScore = score;
                 bestMove = action.move;
@@ -158,45 +305,25 @@ class XrzBot : public BasicBot {
 
    public:
     void init(index_t playerId, const GameConstantsPack& constants) override {
-        this->playerId = playerId;
-        gameConstants = constants;
         state.init(playerId, constants);
-
-        delegate.reset();
-        const std::string delegateName =
-            choosePersistentDelegateName(constants);
-        if (!delegateName.empty()) {
-            delegate.reset(BotFactory::instance().create(delegateName));
-            if (delegate) delegate->init(playerId, constants);
-        }
     }
 
     void requestMove(const BoardView& boardView,
                      const std::vector<RankItem>& rank) override {
         moveQueue.clear();
 
-        if (delegate) {
-            delegate->requestMove(boardView, rank);
-            const Move delegatedMove = delegate->step();
-            if (delegatedMove.type != MoveType::EMPTY) {
-                moveQueue.push_back(delegatedMove);
-            }
-            return;
-        }
-
         state.observe(boardView, rank);
 
-        std::optional<Move> selectedMove = chooseModelMove();
-        if (!selectedMove) selectedMove = chooseFallbackMove();
+        const StrategicMaps maps = buildStrategicMaps();
+        std::optional<Move> selectedMove = chooseModelMove(maps);
+        if (!selectedMove) selectedMove = chooseFallbackMove(maps);
         if (!selectedMove) return;
 
         state.commitSelectedMove(*selectedMove);
         moveQueue.push_back(*selectedMove);
     }
 
-    void onGameEvent(const GameEvent& event) override {
-        if (delegate) delegate->onGameEvent(event);
-    }
+    void onGameEvent(const GameEvent& event) override {}
 };
 
 static BotRegistrar<XrzBot> xrzBot_reg("XrzBot");

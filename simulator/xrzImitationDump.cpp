@@ -37,6 +37,7 @@ struct BoardSize {
 struct LoadedBoard {
     std::string path;
     Board board;
+    int designedPlayerCapacity = 0;
 };
 
 struct SelectedBot {
@@ -49,6 +50,7 @@ struct GameSetup {
     std::vector<SelectedBot> opponents;
     std::string boardLabel;
     Board board;
+    int playerCount = 2;
 };
 
 struct Options {
@@ -57,13 +59,14 @@ struct Options {
     int height = 18;
     int maxSteps = 600;
     int threads = 0;
-    int playerCount = 2;
     bool remainIndex = true;
     std::string outputPath = "rl/datasets/xrz_imitation.jsonl";
+    std::vector<int> playerCounts = {2};
     std::vector<std::string> teachers = {"XiaruizeBot"};
     std::vector<std::string> opponents = {"GcBot", "SmartRandomBot", "oimbot"};
     std::vector<BoardSize> randomBoardSizes;
     std::vector<std::string> mapPaths;
+    std::vector<std::string> mapDirectories;
     std::vector<LoadedBoard> customBoards;
 };
 
@@ -119,29 +122,33 @@ void printUsage() {
         << "  --steps N            Maximum half-turn steps per game (default: "
            "600)\n"
         << "  --threads N          CPU worker threads (default: auto)\n"
-        << "  --players N          Total players per game including the "
-           "teacher (default: 2)\n"
+          << "  --players A B ...    Player-count pool including the teacher "
+              "(default: 2)\n"
         << "  --teacher NAME       Teacher bot name (single-teacher "
            "compatibility mode)\n"
-        << "  --teachers A B ...   Teacher bot pool\n"
+          << "  --teachers A B ...   Teacher bot pool (use 'all' for every "
+              "registered non-Xrz bot)\n"
         << "  --output PATH        JSONL output path (default: "
            "rl/datasets/xrz_imitation.jsonl)\n"
         << "  --size WxH           Add a random-map size to the rotation\n"
         << "  --sizes A B ...      Replace the random-map rotation with "
            "explicit sizes\n"
         << "  --map PATH           Add a custom .lgmp map to the rotation\n"
+          << "  --map-dir PATH       Add all .lgmp maps under a directory\n"
         << "  --maps A B ...       Replace the custom-map rotation with "
            "explicit paths\n"
+          << "  --map-dirs A B ...   Replace the custom-map directory rotation "
+              "with explicit directories\n"
         << "  --shuffle            Randomize player index mapping\n"
-        << "  --opponents A B ...  Opponent pool (default: GcBot "
-           "SmartRandomBot oimbot)\n";
+          << "  --opponents A B ...  Opponent pool (use 'all' for every "
+              "registered non-Xrz bot; default: GcBot SmartRandomBot oimbot)\n";
 }
 
 bool parseArgs(int argc, char** argv, Options& options) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--games" || arg == "--width" || arg == "--height" ||
-            arg == "--players" || arg == "--steps" || arg == "--threads") {
+          if (arg == "--games" || arg == "--width" || arg == "--height" ||
+                arg == "--steps" || arg == "--threads") {
             if (i + 1 >= argc) return false;
             int value = 0;
             if (!parsePositiveInt(argv[++i], value)) return false;
@@ -151,12 +158,19 @@ bool parseArgs(int argc, char** argv, Options& options) {
                 options.width = value;
             else if (arg == "--height")
                 options.height = value;
-            else if (arg == "--players")
-                options.playerCount = value;
             else if (arg == "--threads")
                 options.threads = value;
             else
                 options.maxSteps = value;
+          } else if (arg == "--players") {
+                options.playerCounts.clear();
+                while (i + 1 < argc &&
+                         std::string(argv[i + 1]).rfind("--", 0) != 0) {
+                     int value = 0;
+                     if (!parsePositiveInt(argv[++i], value)) return false;
+                     options.playerCounts.push_back(value);
+                }
+                if (options.playerCounts.empty()) return false;
         } else if (arg == "--teacher") {
             if (i + 1 >= argc) return false;
             options.teachers = {argv[++i]};
@@ -187,6 +201,9 @@ bool parseArgs(int argc, char** argv, Options& options) {
         } else if (arg == "--map") {
             if (i + 1 >= argc) return false;
             options.mapPaths.emplace_back(argv[++i]);
+        } else if (arg == "--map-dir") {
+            if (i + 1 >= argc) return false;
+            options.mapDirectories.emplace_back(argv[++i]);
         } else if (arg == "--maps") {
             options.mapPaths.clear();
             while (i + 1 < argc &&
@@ -194,6 +211,13 @@ bool parseArgs(int argc, char** argv, Options& options) {
                 options.mapPaths.emplace_back(argv[++i]);
             }
             if (options.mapPaths.empty()) return false;
+        } else if (arg == "--map-dirs") {
+            options.mapDirectories.clear();
+            while (i + 1 < argc &&
+                   std::string(argv[i + 1]).rfind("--", 0) != 0) {
+                options.mapDirectories.emplace_back(argv[++i]);
+            }
+            if (options.mapDirectories.empty()) return false;
         } else if (arg == "--shuffle") {
             options.remainIndex = false;
         } else if (arg == "--opponents") {
@@ -210,11 +234,106 @@ bool parseArgs(int argc, char** argv, Options& options) {
             return false;
         }
     }
-    if (options.playerCount < 2) return false;
+    if (options.playerCounts.empty()) return false;
+    std::sort(options.playerCounts.begin(), options.playerCounts.end());
+    options.playerCounts.erase(
+        std::unique(options.playerCounts.begin(), options.playerCounts.end()),
+        options.playerCounts.end());
+    if (options.playerCounts.front() < 2) return false;
     if (options.randomBoardSizes.empty() && options.mapPaths.empty()) {
         options.randomBoardSizes.push_back({options.width, options.height});
     }
     return !options.teachers.empty() && !options.opponents.empty();
+}
+
+bool isAllBotToken(const std::string& text) {
+    std::string lowered = text;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    return lowered == "all";
+}
+
+std::vector<std::string> expandBotPool(
+    const std::vector<std::string>& requested,
+    const std::vector<std::string>& registeredBots) {
+    std::vector<std::string> expanded;
+    auto appendUnique = [&](const std::string& name) {
+        if (std::find(expanded.begin(), expanded.end(), name) ==
+            expanded.end()) {
+            expanded.push_back(name);
+        }
+    };
+
+    const bool wantsAll =
+        std::any_of(requested.begin(), requested.end(), [](const std::string& name) {
+            return isAllBotToken(name);
+        });
+    if (wantsAll) {
+        for (const std::string& name : registeredBots) {
+            if (name == "XrzBot") continue;
+            appendUnique(name);
+        }
+    }
+
+    for (const std::string& name : requested) {
+        if (isAllBotToken(name)) continue;
+        appendUnique(name);
+    }
+    return expanded;
+}
+
+int designedPlayerCapacity(const Board& board) {
+    int spawnCount = 0;
+    int blankCount = 0;
+    for (int row = 1; row <= board.getHeight(); ++row) {
+        for (int col = 1; col <= board.getWidth(); ++col) {
+            const Tile& tile = board.tileAt(row, col);
+            if (tile.type == TILE_SPAWN) {
+                ++spawnCount;
+            } else if (tile.type == TILE_PLAIN && tile.army == 0) {
+                ++blankCount;
+            }
+        }
+    }
+    return spawnCount > 0 ? spawnCount : blankCount;
+}
+
+bool expandMapDirectories(Options& options, std::string& errorMessage) {
+    std::vector<std::string> discovered;
+    for (const std::string& directoryPath : options.mapDirectories) {
+        const std::filesystem::path root(directoryPath);
+        if (!std::filesystem::exists(root)) {
+            errorMessage = "Map directory does not exist: " + directoryPath;
+            return false;
+        }
+        if (!std::filesystem::is_directory(root)) {
+            errorMessage = "Map directory is not a directory: " + directoryPath;
+            return false;
+        }
+
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+            if (!entry.is_regular_file()) continue;
+            std::string extension = entry.path().extension().string();
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                           [](unsigned char ch) {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+            if (extension == ".lgmp") {
+                discovered.push_back(entry.path().string());
+            }
+        }
+    }
+
+    std::sort(discovered.begin(), discovered.end());
+    for (const std::string& path : discovered) {
+        if (std::find(options.mapPaths.begin(), options.mapPaths.end(), path) ==
+            options.mapPaths.end()) {
+            options.mapPaths.push_back(path);
+        }
+    }
+    return true;
 }
 
 int detectWorkerCount(const Options& options) {
@@ -274,13 +393,19 @@ class RecordingTeacherBot : public BasicBot {
         moveQueue.clear();
         state.observe(boardView, rank);
         inner->requestMove(boardView, rank);
-        const Move teacherMove = inner->step();
+        std::deque<Move>& teacherMoves = inner->getMoveQueue();
+        auto executedMove = std::find_if(
+            teacherMoves.begin(), teacherMoves.end(),
+            [this](const Move& move) {
+                return move.type == MoveType::MOVE_ARMY &&
+                       state.isLegalMove(move.from, move.to);
+            });
 
-        if (teacherMove.type == MoveType::MOVE_ARMY) {
+        if (executedMove != teacherMoves.end()) {
             stats->samplesConsidered.fetch_add(1);
             const auto actions = state.enumerateFixedCandidateActions();
             const std::optional<std::size_t> label =
-                state.labelForMove(actions, teacherMove);
+                state.labelForMove(actions, *executedMove);
             if (label) {
                 const std::string payload = serializeSample(actions, *label);
                 {
@@ -291,11 +416,13 @@ class RecordingTeacherBot : public BasicBot {
             } else {
                 stats->samplesOutOfSet.fetch_add(1);
             }
-            state.commitSelectedMove(teacherMove);
+            state.commitSelectedMove(*executedMove);
         }
 
-        if (teacherMove.type != MoveType::EMPTY)
-            moveQueue.push_back(teacherMove);
+        while (!teacherMoves.empty()) {
+            moveQueue.push_back(teacherMoves.front());
+            teacherMoves.pop_front();
+        }
     }
 
     void onGameEvent(const GameEvent& event) override {
@@ -345,6 +472,7 @@ bool loadCustomMap(const std::string& mapPath, LoadedBoard& board,
 
     board.path = mapPath;
     board.board = document.board;
+    board.designedPlayerCapacity = designedPlayerCapacity(board.board);
     return true;
 }
 
@@ -365,6 +493,20 @@ std::mt19937 buildGameRng(int gameNumber) {
     return std::mt19937(seed);
 }
 
+std::vector<int> compatiblePlayerCounts(const Options& options,
+                                        const LoadedBoard* loadedBoard) {
+    if (loadedBoard == nullptr) return options.playerCounts;
+
+    std::vector<int> compatible;
+    compatible.reserve(options.playerCounts.size());
+    for (int playerCount : options.playerCounts) {
+        if (playerCount <= loadedBoard->designedPlayerCapacity) {
+            compatible.push_back(playerCount);
+        }
+    }
+    return compatible;
+}
+
 template <typename T>
 const T& chooseFromPool(const std::vector<T>& pool, std::mt19937& rng) {
     std::uniform_int_distribution<std::size_t> dist(0, pool.size() - 1);
@@ -373,7 +515,7 @@ const T& chooseFromPool(const std::vector<T>& pool, std::mt19937& rng) {
 
 std::vector<SelectedBot> chooseOpponents(const Options& options,
                                          const std::string& teacherName,
-                                         std::mt19937& rng) {
+                                         int playerCount, std::mt19937& rng) {
     std::vector<std::string> candidatePool;
     candidatePool.reserve(options.opponents.size());
     for (const std::string& name : options.opponents) {
@@ -382,14 +524,14 @@ std::vector<SelectedBot> chooseOpponents(const Options& options,
     if (candidatePool.empty()) candidatePool = options.opponents;
 
     std::vector<SelectedBot> selected;
-    selected.reserve(std::max(1, options.playerCount - 1));
+    selected.reserve(std::max(1, playerCount - 1));
     std::vector<std::string> shuffledPool = candidatePool;
     int shuffleRound = 0;
-    while (static_cast<int>(selected.size()) < options.playerCount - 1) {
+    while (static_cast<int>(selected.size()) < playerCount - 1) {
         if (shuffledPool.empty()) break;
         std::shuffle(shuffledPool.begin(), shuffledPool.end(), rng);
         for (const std::string& botName : shuffledPool) {
-            if (static_cast<int>(selected.size()) >= options.playerCount - 1) {
+            if (static_cast<int>(selected.size()) >= playerCount - 1) {
                 break;
             }
             const int opponentSlot = static_cast<int>(selected.size()) + 1;
@@ -398,7 +540,7 @@ std::vector<SelectedBot> chooseOpponents(const Options& options,
             selected.push_back({botName, displayName.str()});
         }
         ++shuffleRound;
-        if (shuffleRound > options.playerCount + 2) break;
+        if (shuffleRound > playerCount + 2) break;
     }
     return selected;
 }
@@ -409,14 +551,24 @@ GameSetup selectGameSetup(const Options& options, int gameNumber) {
     GameSetup setup;
     setup.teacher.botName = chooseFromPool(options.teachers, rng);
     setup.teacher.displayName = setup.teacher.botName + " [teacher]";
-    setup.opponents = chooseOpponents(options, setup.teacher.botName, rng);
 
     const std::size_t randomBoardCount = options.randomBoardSizes.size();
-    const std::size_t customBoardCount = options.customBoards.size();
-    const std::size_t totalBoardCount = randomBoardCount + customBoardCount;
+    std::vector<std::size_t> compatibleCustomBoards;
+    compatibleCustomBoards.reserve(options.customBoards.size());
+    for (std::size_t index = 0; index < options.customBoards.size(); ++index) {
+        if (!compatiblePlayerCounts(options, &options.customBoards[index]).empty()) {
+            compatibleCustomBoards.push_back(index);
+        }
+    }
+
+    const std::size_t totalBoardCount =
+        randomBoardCount + compatibleCustomBoards.size();
     if (totalBoardCount == 0) {
         setup.board = Board::generate(options.width, options.height);
         setup.boardLabel = boardSizeLabel({options.width, options.height});
+        setup.playerCount = chooseFromPool(options.playerCounts, rng);
+        setup.opponents = chooseOpponents(options, setup.teacher.botName,
+                                          setup.playerCount, rng);
         return setup;
     }
 
@@ -427,12 +579,19 @@ GameSetup selectGameSetup(const Options& options, int gameNumber) {
         const BoardSize& boardSize = options.randomBoardSizes[boardIndex];
         setup.board = Board::generate(boardSize.width, boardSize.height);
         setup.boardLabel = boardSizeLabel(boardSize);
+        setup.playerCount = chooseFromPool(options.playerCounts, rng);
     } else {
-        const LoadedBoard& loadedBoard =
-            options.customBoards[boardIndex - randomBoardCount];
+        const LoadedBoard& loadedBoard = options.customBoards
+            [compatibleCustomBoards[boardIndex - randomBoardCount]];
         setup.board = loadedBoard.board;
         setup.boardLabel = loadedBoard.path;
+        const std::vector<int> compatibleCounts =
+            compatiblePlayerCounts(options, &loadedBoard);
+        setup.playerCount = chooseFromPool(compatibleCounts, rng);
     }
+
+    setup.opponents = chooseOpponents(options, setup.teacher.botName,
+                                      setup.playerCount, rng);
 
     return setup;
 }
@@ -447,9 +606,9 @@ GameResult runSingleGame(const Options& options, int gameNumber,
     std::vector<Player*> players;
     std::vector<index_t> teams;
     std::vector<std::string> names;
-    players.reserve(options.playerCount);
-    teams.reserve(options.playerCount);
-    names.reserve(options.playerCount);
+    players.reserve(setup.playerCount);
+    teams.reserve(setup.playerCount);
+    names.reserve(setup.playerCount);
 
     players.push_back(new RecordingTeacherBot(setup.teacher.botName, output,
                                               outputMutex, stats));
@@ -504,6 +663,8 @@ int main(int argc, char** argv) {
     }
 
     const auto registeredBots = BotFactory::instance().list();
+    options.teachers = expandBotPool(options.teachers, registeredBots);
+    options.opponents = expandBotPool(options.opponents, registeredBots);
     auto isRegistered = [&](const std::string& name) {
         return std::find(registeredBots.begin(), registeredBots.end(), name) !=
                registeredBots.end();
@@ -522,9 +683,13 @@ int main(int argc, char** argv) {
     }
 
     std::string mapError;
-    if (!loadCustomMaps(options, mapError)) {
+    if (!expandMapDirectories(options, mapError)) {
         std::cerr << mapError << '\n';
         return 4;
+    }
+    if (!loadCustomMaps(options, mapError)) {
+        std::cerr << mapError << '\n';
+        return 5;
     }
 
     const std::filesystem::path outputPath(options.outputPath);
@@ -535,7 +700,7 @@ int main(int argc, char** argv) {
     if (!output.is_open()) {
         std::cerr << "Failed to open output file: " << options.outputPath
                   << '\n';
-        return 5;
+        return 6;
     }
 
     const int workerCount = detectWorkerCount(options);
@@ -557,7 +722,11 @@ int main(int argc, char** argv) {
     for (const std::string& opponent : options.opponents) {
         std::cout << ' ' << opponent;
     }
-    std::cout << "\nPlayers per game: " << options.playerCount << "\nBoards:";
+    std::cout << "\nPlayer-count pool:";
+    for (int playerCount : options.playerCounts) {
+        std::cout << ' ' << playerCount;
+    }
+    std::cout << "\nBoards:";
     if (!options.randomBoardSizes.empty()) {
         for (const BoardSize& boardSize : options.randomBoardSizes) {
             std::cout << ' ' << boardSizeLabel(boardSize);
@@ -603,7 +772,7 @@ int main(int argc, char** argv) {
             std::rethrow_exception(workerError);
         } catch (const std::exception& ex) {
             std::cerr << "Dataset dump failed: " << ex.what() << std::endl;
-            return 6;
+            return 7;
         }
     }
 

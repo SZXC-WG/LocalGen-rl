@@ -30,8 +30,8 @@ class TrainingConfig:
     eval_interval: int = 50
     eval_episodes: int = 12
     log_interval: int = 10
-    hidden1_size: int = 64
-    hidden2_size: int = 32
+    hidden1_size: int = 96
+    hidden2_size: int = 48
     device: str = "auto"
 
     def as_dict(self) -> dict[str, Any]:

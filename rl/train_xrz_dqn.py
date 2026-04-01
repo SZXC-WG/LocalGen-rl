@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--episodes", type=int, default=None, help="Override RL fine-tuning episode count")
     parser.add_argument("--bc-epochs", type=int, default=None, help="Override behavior-cloning epoch count")
+    parser.add_argument("--hidden1-size", type=int, default=None, help="Override the first hidden layer width")
+    parser.add_argument("--hidden2-size", type=int, default=None, help="Override the second hidden layer width")
     parser.add_argument(
         "--dataset",
         type=Path,
@@ -626,6 +628,10 @@ def main() -> None:
         config.episodes = args.episodes
     if args.bc_epochs is not None:
         config.bc_epochs = args.bc_epochs
+    if args.hidden1_size is not None:
+        config.hidden1_size = args.hidden1_size
+    if args.hidden2_size is not None:
+        config.hidden2_size = args.hidden2_size
     if args.seed is not None:
         config.seed = args.seed
     config.device = args.device
