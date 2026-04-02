@@ -11,7 +11,7 @@ from typing import Any, Optional, Sequence
 import torch
 import torch.nn.functional as F
 from torch import optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset, SubsetRandomSampler, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from localgen_rl import (
@@ -22,6 +22,7 @@ from localgen_rl import (
     TrainingConfig,
     Transition,
     export_cpp_header,
+    warm_start_model,
 )
 from localgen_rl.model import mask_illegal_q_values
 
@@ -32,14 +33,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--episodes", type=int, default=None, help="Override RL fine-tuning episode count")
     parser.add_argument("--bc-epochs", type=int, default=None, help="Override behavior-cloning epoch count")
+    parser.add_argument("--bc-batch-size", type=int, default=None, help="Override behavior-cloning batch size")
+    parser.add_argument(
+        "--bc-learning-rate",
+        type=float,
+        default=None,
+        help="Override behavior-cloning learning rate",
+    )
     parser.add_argument("--hidden1-size", type=int, default=None, help="Override the first hidden layer width")
     parser.add_argument("--hidden2-size", type=int, default=None, help="Override the second hidden layer width")
+    parser.add_argument("--hidden3-size", type=int, default=None, help="Override the optional third hidden layer width")
     parser.add_argument(
         "--dataset",
         type=Path,
         action="append",
         default=None,
-        help="Imitation dataset JSONL path. Repeat the flag to mix multiple files.",
+        help=(
+            "Imitation dataset JSONL path. Repeat the flag to mix multiple files "
+            "or intentionally up-weight a corpus by passing the same path again."
+        ),
     )
     parser.add_argument("--skip-bc", action="store_true", help="Skip behavior cloning even if a dataset exists")
     parser.add_argument("--skip-rl", action="store_true", help="Skip RL fine-tuning after behavior cloning")
@@ -63,6 +75,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Checkpoint to resume from or evaluate",
+    )
+    parser.add_argument(
+        "--bc-init",
+        type=Path,
+        default=None,
+        help="Warm-start behavior cloning from a checkpoint or exported header",
     )
     return parser.parse_args()
 
@@ -314,73 +332,133 @@ def read_float(payload: dict[str, object], key: str, default: float) -> float:
     return float(value) if isinstance(value, (int, float, str)) else default
 
 
+def iter_imitation_samples(
+    dataset_path: Path,
+    *,
+    expected_feature_count: int,
+):
+    with dataset_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            payload = json.loads(stripped)
+            sample_action = int(payload["action"])
+            sample_legal_mask = [bool(value) for value in payload["legal_mask"]]
+            sample_features = [
+                [float(value) for value in feature_row]
+                for feature_row in payload["action_features"]
+            ]
+
+            if len(sample_features) != len(sample_legal_mask):
+                raise ValueError(
+                    f"dataset {dataset_path} line {line_number}: feature rows != legal mask length"
+                )
+            if not sample_features:
+                raise ValueError(f"dataset {dataset_path} line {line_number}: empty action set")
+            if sample_action < 0 or sample_action >= len(sample_features):
+                raise ValueError(
+                    f"dataset {dataset_path} line {line_number}: action index out of range"
+                )
+            if not sample_legal_mask[sample_action]:
+                raise ValueError(
+                    f"dataset {dataset_path} line {line_number}: label points to an illegal action"
+                )
+            sample_feature_count = len(sample_features[0])
+            if any(len(feature_row) != sample_feature_count for feature_row in sample_features):
+                raise ValueError(
+                    f"dataset {dataset_path} line {line_number}: inconsistent feature row widths"
+                )
+            if sample_feature_count > expected_feature_count:
+                raise ValueError(
+                    f"dataset {dataset_path} line {line_number}: expected at most {expected_feature_count} features"
+                )
+
+            yield {
+                "action": sample_action,
+                "action_count": len(sample_features),
+                "feature_count": sample_feature_count,
+                "features": sample_features,
+                "legal_mask": sample_legal_mask,
+                "legal_action_count": sum(sample_legal_mask),
+            }
+
+
 def load_imitation_dataset(
     dataset_paths: Sequence[Path],
     *,
     expected_feature_count: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     if not dataset_paths:
         raise FileNotFoundError("no imitation datasets were provided")
 
-    action_features: list[list[list[float]]] = []
-    legal_masks: list[list[bool]] = []
-    actions: list[int] = []
-    action_counts: list[int] = []
+    unique_dataset_paths: list[Path] = []
+    dataset_repeat_counts: dict[Path, int] = {}
+    for dataset_path in dataset_paths:
+        if dataset_path not in dataset_repeat_counts:
+            unique_dataset_paths.append(dataset_path)
+            dataset_repeat_counts[dataset_path] = 0
+        dataset_repeat_counts[dataset_path] += 1
+
+    total_samples = 0
     max_action_count = 0
+    min_action_count: Optional[int] = None
+    total_action_count = 0
+    min_feature_count: Optional[int] = None
+    max_feature_count = 0
+    total_feature_count = 0
+    total_legal_action_count = 0
     dataset_breakdown: list[dict[str, Any]] = []
 
-    for dataset_path in dataset_paths:
+    for dataset_path in unique_dataset_paths:
         if not dataset_path.exists():
             raise FileNotFoundError(f"imitation dataset not found: {dataset_path}")
 
+        repeat_count = dataset_repeat_counts[dataset_path]
+
         file_samples = 0
-        file_action_counts: list[int] = []
-        file_legal_counts: list[int] = []
+        file_action_count_total = 0
+        file_legal_action_count_total = 0
+        file_feature_count_total = 0
+        file_min_feature_count: Optional[int] = None
+        file_max_feature_count = 0
 
-        with dataset_path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                payload = json.loads(stripped)
-                sample_action = int(payload["action"])
-                sample_legal_mask = [bool(value) for value in payload["legal_mask"]]
-                sample_features = [
-                    [float(value) for value in feature_row]
-                    for feature_row in payload["action_features"]
-                ]
+        for sample in iter_imitation_samples(
+            dataset_path,
+            expected_feature_count=expected_feature_count,
+        ):
+            sample_action_count = int(sample["action_count"])
+            sample_feature_count = int(sample["feature_count"])
+            sample_legal_action_count = int(sample["legal_action_count"])
 
-                if len(sample_features) != len(sample_legal_mask):
-                    raise ValueError(
-                        f"dataset {dataset_path} line {line_number}: feature rows != legal mask length"
-                    )
-                if not sample_features:
-                    raise ValueError(f"dataset {dataset_path} line {line_number}: empty action set")
-                if sample_action < 0 or sample_action >= len(sample_features):
-                    raise ValueError(
-                        f"dataset {dataset_path} line {line_number}: action index out of range"
-                    )
-                if not sample_legal_mask[sample_action]:
-                    raise ValueError(
-                        f"dataset {dataset_path} line {line_number}: label points to an illegal action"
-                    )
-                if any(
-                    len(feature_row) != expected_feature_count
-                    for feature_row in sample_features
-                ):
-                    raise ValueError(
-                        f"dataset {dataset_path} line {line_number}: expected {expected_feature_count} features"
-                    )
+            max_action_count = max(max_action_count, sample_action_count)
+            min_action_count = (
+                sample_action_count
+                if min_action_count is None
+                else min(min_action_count, sample_action_count)
+            )
+            total_action_count += sample_action_count
+            min_feature_count = (
+                sample_feature_count
+                if min_feature_count is None
+                else min(min_feature_count, sample_feature_count)
+            )
+            max_feature_count = max(max_feature_count, sample_feature_count)
+            total_feature_count += sample_feature_count
+            total_legal_action_count += sample_legal_action_count
 
-                const_action_count = len(sample_features)
-                max_action_count = max(max_action_count, const_action_count)
-                action_counts.append(const_action_count)
-                file_action_counts.append(const_action_count)
-                file_legal_counts.append(sum(sample_legal_mask))
-                action_features.append(sample_features)
-                legal_masks.append(sample_legal_mask)
-                actions.append(sample_action)
-                file_samples += 1
+            file_action_count_total += sample_action_count
+            file_legal_action_count_total += sample_legal_action_count
+            file_feature_count_total += sample_feature_count
+            file_min_feature_count = (
+                sample_feature_count
+                if file_min_feature_count is None
+                else min(file_min_feature_count, sample_feature_count)
+            )
+            file_max_feature_count = max(file_max_feature_count, sample_feature_count)
+
+            total_samples += 1
+            file_samples += 1
 
         if file_samples == 0:
             raise RuntimeError(f"imitation dataset is empty: {dataset_path}")
@@ -388,47 +466,74 @@ def load_imitation_dataset(
         dataset_breakdown.append(
             {
                 "path": str(dataset_path),
+                "repeat_count": repeat_count,
                 "sample_count": file_samples,
-                "average_action_count": sum(file_action_counts) / max(1, file_samples),
-                "average_legal_actions": sum(file_legal_counts) / max(1, file_samples),
+                "effective_sample_count": file_samples * repeat_count,
+                "average_action_count": file_action_count_total / max(1, file_samples),
+                "average_legal_actions": file_legal_action_count_total / max(1, file_samples),
+                "average_feature_count": file_feature_count_total / max(1, file_samples),
+                "min_feature_count": file_min_feature_count,
+                "max_feature_count": file_max_feature_count,
             }
         )
 
-    if not actions:
+    if total_samples == 0:
         raise RuntimeError("all provided imitation datasets were empty")
 
     action_features_tensor = torch.zeros(
-        (len(actions), max_action_count, expected_feature_count),
+        (total_samples, max_action_count, expected_feature_count),
         dtype=torch.float32,
     )
-    legal_masks_tensor = torch.zeros((len(actions), max_action_count), dtype=torch.bool)
-    for sample_index, (sample_features, sample_legal_mask) in enumerate(
-        zip(action_features, legal_masks)
-    ):
-        sample_action_count = len(sample_features)
-        action_features_tensor[sample_index, :sample_action_count] = torch.tensor(
-            sample_features,
-            dtype=torch.float32,
+    legal_masks_tensor = torch.zeros((total_samples, max_action_count), dtype=torch.bool)
+    actions_tensor = torch.empty(total_samples, dtype=torch.long)
+    sample_weights_tensor = torch.empty(total_samples, dtype=torch.int32)
+
+    sample_index = 0
+    for dataset_path in unique_dataset_paths:
+        repeat_count = dataset_repeat_counts[dataset_path]
+        for sample in iter_imitation_samples(
+            dataset_path,
+            expected_feature_count=expected_feature_count,
+        ):
+            sample_action_count = int(sample["action_count"])
+            sample_feature_count = int(sample["feature_count"])
+            action_features_tensor[
+                sample_index,
+                :sample_action_count,
+                :sample_feature_count,
+            ] = torch.tensor(sample["features"], dtype=torch.float32)
+            legal_masks_tensor[sample_index, :sample_action_count] = torch.tensor(
+                sample["legal_mask"],
+                dtype=torch.bool,
+            )
+            actions_tensor[sample_index] = int(sample["action"])
+            sample_weights_tensor[sample_index] = repeat_count
+            sample_index += 1
+
+    if sample_index != total_samples:
+        raise RuntimeError(
+            f"dataset reload count mismatch: loaded {sample_index} samples, expected {total_samples}"
         )
-        legal_masks_tensor[sample_index, :sample_action_count] = torch.tensor(
-            sample_legal_mask,
-            dtype=torch.bool,
-        )
-    actions_tensor = torch.tensor(actions, dtype=torch.long)
+
     legal_actions_per_state = legal_masks_tensor.sum(dim=1).float()
     stats = {
         "dataset_file_count": len(dataset_breakdown),
         "dataset_breakdown": dataset_breakdown,
         "sample_count": float(actions_tensor.shape[0]),
+        "effective_sample_count": float(sample_weights_tensor.sum().item()),
+        "average_sample_weight": float(sample_weights_tensor.float().mean().item()),
         "max_action_count": float(action_features_tensor.shape[1]),
-        "min_action_count": float(min(action_counts)),
-        "average_action_count": float(sum(action_counts) / max(1, len(action_counts))),
+        "min_action_count": float(min_action_count or 0),
+        "average_action_count": float(total_action_count / max(1, total_samples)),
         "feature_count": float(action_features_tensor.shape[2]),
+        "min_feature_count": float(min_feature_count or 0),
+        "max_feature_count": float(max_feature_count),
+        "average_feature_count": float(total_feature_count / max(1, total_samples)),
         "average_legal_actions": float(legal_actions_per_state.mean().item()),
         "min_legal_actions": float(legal_actions_per_state.min().item()),
         "max_legal_actions": float(legal_actions_per_state.max().item()),
     }
-    return action_features_tensor, legal_masks_tensor, actions_tensor, stats
+    return action_features_tensor, legal_masks_tensor, actions_tensor, sample_weights_tensor, stats
 
 
 def make_supervised_loaders(
@@ -439,11 +544,38 @@ def make_supervised_loaders(
     batch_size: int,
     validation_fraction: float,
     seed: int,
-) -> tuple[DataLoader, Optional[DataLoader]]:
+    sample_weights: Optional[torch.Tensor] = None,
+) -> tuple[DataLoader, Optional[DataLoader], dict[str, float]]:
     dataset = TensorDataset(action_features, legal_masks, actions)
     total_size = len(dataset)
+    generator = torch.Generator().manual_seed(seed)
+
+    if sample_weights is None:
+        sample_weights = torch.ones(total_size, dtype=torch.int32)
+    else:
+        sample_weights = sample_weights.to(dtype=torch.int32)
+
+    def expand_indices(indices: Sequence[int]) -> list[int]:
+        expanded: list[int] = []
+        for index in indices:
+            repeat_count = max(1, int(sample_weights[index].item()))
+            expanded.extend([index] * repeat_count)
+        return expanded
+
     if total_size == 1:
-        return DataLoader(dataset, batch_size=1, shuffle=True), None
+        train_indices = [0]
+        expanded_train_indices = expand_indices(train_indices)
+        train_loader = DataLoader(
+            dataset,
+            batch_size=1,
+            sampler=SubsetRandomSampler(expanded_train_indices, generator=generator),
+        )
+        split_stats = {
+            "train_unique_samples": 1.0,
+            "train_effective_samples": float(len(expanded_train_indices)),
+            "validation_samples": 0.0,
+        }
+        return train_loader, None, split_stats
 
     validation_size = int(total_size * validation_fraction)
     if validation_fraction > 0.0:
@@ -451,15 +583,27 @@ def make_supervised_loaders(
     validation_size = min(validation_size, total_size - 1)
     train_size = total_size - validation_size
 
-    generator = torch.Generator().manual_seed(seed)
-    train_dataset, validation_dataset = torch.utils.data.random_split(
+    shuffled_indices = torch.randperm(total_size, generator=generator).tolist()
+    validation_indices = shuffled_indices[:validation_size]
+    train_indices = shuffled_indices[validation_size: validation_size + train_size]
+    expanded_train_indices = expand_indices(train_indices)
+
+    train_loader = DataLoader(
         dataset,
-        [train_size, validation_size],
-        generator=generator,
+        batch_size=batch_size,
+        sampler=SubsetRandomSampler(expanded_train_indices, generator=generator),
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    validation_loader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, validation_loader
+    validation_loader = DataLoader(
+        Subset(dataset, validation_indices),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+    split_stats = {
+        "train_unique_samples": float(len(train_indices)),
+        "train_effective_samples": float(len(expanded_train_indices)),
+        "validation_samples": float(len(validation_indices)),
+    }
+    return train_loader, validation_loader, split_stats
 
 
 @torch.no_grad()
@@ -507,17 +651,18 @@ def run_behavior_cloning(
     device: torch.device,
     writer: SummaryWriter,
 ) -> dict[str, Any]:
-    action_features, legal_masks, actions, dataset_stats = load_imitation_dataset(
+    action_features, legal_masks, actions, sample_weights, dataset_stats = load_imitation_dataset(
         dataset_paths,
         expected_feature_count=model.input_dim,
     )
-    train_loader, validation_loader = make_supervised_loaders(
+    train_loader, validation_loader, split_stats = make_supervised_loaders(
         action_features,
         legal_masks,
         actions,
         batch_size=config.bc_batch_size,
         validation_fraction=config.bc_validation_fraction,
         seed=config.seed,
+        sample_weights=sample_weights,
     )
 
     optimizer = optim.AdamW(
@@ -534,19 +679,28 @@ def run_behavior_cloning(
         "\n".join(str(dataset_path) for dataset_path in dataset_paths),
     )
     writer.add_text("imitation/dataset_stats", json.dumps(dataset_stats, indent=2))
+    writer.add_text("imitation/split_stats", json.dumps(split_stats, indent=2))
     dataset_breakdown = list(dataset_stats["dataset_breakdown"])
     print(
         f"Loaded {int(dataset_stats['dataset_file_count'])} imitation dataset(s) with "
-        f"{int(dataset_stats['sample_count'])} samples total, "
+        f"{int(dataset_stats['sample_count'])} unique samples total "
+        f"({int(dataset_stats['effective_sample_count'])} effective weighted samples), "
         f"{int(dataset_stats['min_action_count'])}-{int(dataset_stats['max_action_count'])} actions/state, "
         f"{int(dataset_stats['feature_count'])} features/action."
     )
     for dataset_info in dataset_breakdown:
         print(
             f"  - {dataset_info['path']}: {int(dataset_info['sample_count'])} samples, "
+            f"repeat={int(dataset_info['repeat_count'])}, "
+            f"effective={int(dataset_info['effective_sample_count'])}, "
             f"avg_actions={dataset_info['average_action_count']:.1f}, "
             f"avg_legal={dataset_info['average_legal_actions']:.1f}"
         )
+    print(
+        f"  -> train unique={int(split_stats['train_unique_samples'])}, "
+        f"train effective={int(split_stats['train_effective_samples'])}, "
+        f"validation={int(split_stats['validation_samples'])}"
+    )
 
     for epoch in range(1, config.bc_epochs + 1):
         model.train()
@@ -612,6 +766,7 @@ def run_behavior_cloning(
     final_validation = evaluate_imitation_loader(model, validation_loader, device=device)
     result = {
         **dataset_stats,
+        **split_stats,
         "best_val_accuracy": best_accuracy,
         "final_val_loss": final_validation["loss"],
         "final_val_accuracy": final_validation["accuracy"],
@@ -628,35 +783,33 @@ def main() -> None:
         config.episodes = args.episodes
     if args.bc_epochs is not None:
         config.bc_epochs = args.bc_epochs
+    if args.bc_batch_size is not None:
+        config.bc_batch_size = args.bc_batch_size
+    if args.bc_learning_rate is not None:
+        config.bc_learning_rate = args.bc_learning_rate
     if args.hidden1_size is not None:
         config.hidden1_size = args.hidden1_size
     if args.hidden2_size is not None:
         config.hidden2_size = args.hidden2_size
+    if args.hidden3_size is not None:
+        config.hidden3_size = args.hidden3_size
     if args.seed is not None:
         config.seed = args.seed
     config.device = args.device
 
-    paths = config.resolve(repo_root)
+    default_paths = config.resolve(repo_root)
+    export_header_path = args.export_header or default_paths["export_header_path"]
+    paths = config.resolve(repo_root, export_header_path=export_header_path)
     requested_dataset_paths = args.dataset or list(paths["dataset_paths"])
-    export_header_path = args.export_header or paths["export_header_path"]
     export_namespace = args.export_namespace
     for key in ("runs_dir", "checkpoints_dir"):
         paths[key].mkdir(parents=True, exist_ok=True)
 
-    deduped_dataset_paths: list[Path] = []
-    seen_dataset_paths: set[str] = set()
-    for dataset_path in requested_dataset_paths:
-        dataset_key = str(dataset_path)
-        if dataset_key in seen_dataset_paths:
-            continue
-        seen_dataset_paths.add(dataset_key)
-        deduped_dataset_paths.append(dataset_path)
-
-    missing_dataset_paths = [path for path in deduped_dataset_paths if not path.exists()]
+    missing_dataset_paths = [path for path in requested_dataset_paths if not path.exists()]
     if args.dataset is not None and missing_dataset_paths:
         missing_text = ", ".join(str(path) for path in missing_dataset_paths)
         raise FileNotFoundError(f"imitation dataset(s) not found: {missing_text}")
-    available_dataset_paths = [path for path in deduped_dataset_paths if path.exists()]
+    available_dataset_paths = [path for path in requested_dataset_paths if path.exists()]
 
     set_seed(config.seed)
     torch.set_float32_matmul_precision("high")
@@ -672,21 +825,46 @@ def main() -> None:
             {
                 "header": str(export_header_path),
                 "namespace": export_namespace,
+                "checkpoint": str(paths["checkpoint_path"]),
+                "best_checkpoint": str(paths["best_checkpoint_path"]),
+            },
+            indent=2,
+        ),
+    )
+    writer.add_text(
+        "model/architecture",
+        json.dumps(
+            {
+                "input_dim": len(FEATURE_NAMES),
+                "hidden1_size": config.hidden1_size,
+                "hidden2_size": config.hidden2_size,
+                "hidden3_size": config.hidden3_size,
             },
             indent=2,
         ),
     )
 
     online_net = ActionValueNet(
-        hidden1_size=config.hidden1_size, hidden2_size=config.hidden2_size
+        hidden1_size=config.hidden1_size,
+        hidden2_size=config.hidden2_size,
+        hidden3_size=config.hidden3_size,
     ).to(device)
     target_net = ActionValueNet(
-        hidden1_size=config.hidden1_size, hidden2_size=config.hidden2_size
+        hidden1_size=config.hidden1_size,
+        hidden2_size=config.hidden2_size,
+        hidden3_size=config.hidden3_size,
     ).to(device)
     target_net.load_state_dict(online_net.state_dict())
     target_net.eval()
 
-    checkpoint_to_use = args.checkpoint or paths["checkpoint_path"]
+    checkpoint_candidates = [args.checkpoint] if args.checkpoint is not None else [
+        paths["checkpoint_path"],
+        paths["best_checkpoint_path"],
+    ]
+    checkpoint_to_use = next(
+        (candidate for candidate in checkpoint_candidates if candidate.exists()),
+        checkpoint_candidates[0],
+    )
     start_episode = 1
     total_steps = 0
     best_win_rate = -1.0
@@ -731,6 +909,15 @@ def main() -> None:
 
     if not args.skip_bc:
         if available_dataset_paths:
+            if args.bc_init is not None:
+                warm_start_summary = warm_start_model(online_net, args.bc_init)
+                target_net.load_state_dict(online_net.state_dict())
+                writer.add_text("bc/warm_start", json.dumps(warm_start_summary, indent=2))
+                print(
+                    f"Warm-started BC from {warm_start_summary['source_path']} "
+                    f"({warm_start_summary['source_type']}, "
+                    f"copied {warm_start_summary['copied_parameter_count']} parameter tensors)."
+                )
             bc_metrics = run_behavior_cloning(
                 online_net,
                 config,
@@ -752,7 +939,7 @@ def main() -> None:
             total_steps = 0
             best_win_rate = -1.0
         else:
-            missing_text = ", ".join(str(path) for path in deduped_dataset_paths)
+            missing_text = ", ".join(str(path) for path in requested_dataset_paths)
             print(f"Imitation dataset not found in [{missing_text}]; skipping BC pretraining.")
 
     if args.skip_rl or config.episodes <= 0:

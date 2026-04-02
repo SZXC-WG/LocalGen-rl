@@ -23,8 +23,8 @@
 
 class XrzBot : public BasicBot {
    private:
-    static constexpr std::size_t kRuntimeDuelSourceCount = 32;
-    static constexpr std::size_t kRuntimeFfaSourceCount = 48;
+    static constexpr std::size_t kRuntimeDuelSourceCount = 48;
+    static constexpr std::size_t kRuntimeFfaSourceCount = 64;
     static constexpr int kUnreachableDistance = 1'000'000;
 
     static_assert(
@@ -53,14 +53,17 @@ class XrzBot : public BasicBot {
     }
 
     template <std::size_t InputSize, std::size_t Hidden1Size,
-              std::size_t Hidden2Size>
+              std::size_t Hidden2Size, std::size_t Hidden3Size>
     double evaluatePolicyModel(
         const std::array<double, InputSize>& features,
         const std::array<double, InputSize * Hidden1Size>& layer1Weights,
         const std::array<double, Hidden1Size>& layer1Bias,
         const std::array<double, Hidden1Size * Hidden2Size>& layer2Weights,
         const std::array<double, Hidden2Size>& layer2Bias,
-        const std::array<double, Hidden2Size>& outputWeights,
+        const std::array<double, Hidden2Size * Hidden3Size>& layer3Weights,
+        const std::array<double, Hidden3Size>& layer3Bias,
+        const std::array<double, (Hidden3Size > 0 ? Hidden3Size : Hidden2Size)>&
+            outputWeights,
         const std::array<double, 1>& outputBias) const {
         std::array<double, Hidden1Size> hidden1{};
         for (std::size_t outIndex = 0; outIndex < Hidden1Size; ++outIndex) {
@@ -82,6 +85,25 @@ class XrzBot : public BasicBot {
             hidden2[outIndex] = relu(sum);
         }
 
+        if constexpr (Hidden3Size > 0) {
+            std::array<double, Hidden3Size> hidden3{};
+            for (std::size_t outIndex = 0; outIndex < Hidden3Size; ++outIndex) {
+                double sum = layer3Bias[outIndex];
+                for (std::size_t inIndex = 0; inIndex < Hidden2Size;
+                     ++inIndex) {
+                    sum += layer3Weights[outIndex * Hidden2Size + inIndex] *
+                           hidden2[inIndex];
+                }
+                hidden3[outIndex] = relu(sum);
+            }
+
+            double output = outputBias[0];
+            for (std::size_t index = 0; index < Hidden3Size; ++index) {
+                output += outputWeights[index] * hidden3[index];
+            }
+            return output;
+        }
+
         double output = outputBias[0];
         for (std::size_t index = 0; index < Hidden2Size; ++index) {
             output += outputWeights[index] * hidden2[index];
@@ -95,7 +117,8 @@ class XrzBot : public BasicBot {
         return evaluatePolicyModel(
             features, xrz_rl_duel_model::kLayer1Weights,
             xrz_rl_duel_model::kLayer1Bias, xrz_rl_duel_model::kLayer2Weights,
-            xrz_rl_duel_model::kLayer2Bias, xrz_rl_duel_model::kOutputWeights,
+            xrz_rl_duel_model::kLayer2Bias, xrz_rl_duel_model::kLayer3Weights,
+            xrz_rl_duel_model::kLayer3Bias, xrz_rl_duel_model::kOutputWeights,
             xrz_rl_duel_model::kOutputBias);
     }
 
@@ -105,7 +128,8 @@ class XrzBot : public BasicBot {
         return evaluatePolicyModel(
             features, xrz_rl_ffa_model::kLayer1Weights,
             xrz_rl_ffa_model::kLayer1Bias, xrz_rl_ffa_model::kLayer2Weights,
-            xrz_rl_ffa_model::kLayer2Bias, xrz_rl_ffa_model::kOutputWeights,
+            xrz_rl_ffa_model::kLayer2Bias, xrz_rl_ffa_model::kLayer3Weights,
+            xrz_rl_ffa_model::kLayer3Bias, xrz_rl_ffa_model::kOutputWeights,
             xrz_rl_ffa_model::kOutputBias);
     }
 
@@ -123,8 +147,7 @@ class XrzBot : public BasicBot {
         const pos_t height = state.mapHeight();
         const pos_t width = state.mapWidth();
         const pos_t stride = width + 2;
-        std::vector<int> distances((height + 2) * stride,
-                                   kUnreachableDistance);
+        std::vector<int> distances((height + 2) * stride, kUnreachableDistance);
         std::deque<Coord> frontier;
 
         for (pos_t x = 1; x <= height; ++x) {
@@ -171,16 +194,15 @@ class XrzBot : public BasicBot {
         });
         maps.expansionDistances = buildDistanceMap([this](Coord coord) {
             const tile_type_e terrain = state.observedTerrainAt(coord);
-            return state.observedOccupierAt(coord) == -1 && terrain != TILE_CITY &&
-                   terrain != TILE_SWAMP;
+            return state.observedOccupierAt(coord) == -1 &&
+                   terrain != TILE_CITY && terrain != TILE_SWAMP;
         });
         return maps;
     }
 
     double distanceProgressBonus(const std::vector<int>& distances,
                                  const xrz_policy::CandidateAction& action,
-                                 double stepWeight,
-                                 double arrivalBonus) const {
+                                 double stepWeight, double arrivalBonus) const {
         if (distances.empty()) return 0.0;
         const int fromDistance = distances[cellIndex(action.source)];
         const int toDistance = distances[cellIndex(action.target)];
@@ -189,13 +211,15 @@ class XrzBot : public BasicBot {
             return 0.0;
         }
 
-        double bonus = stepWeight * static_cast<double>(fromDistance - toDistance);
+        double bonus =
+            stepWeight * static_cast<double>(fromDistance - toDistance);
         if (toDistance == 0 && fromDistance > 0) bonus += arrivalBonus;
         return bonus;
     }
 
-    double strategicRouteBonus(const StrategicMaps& maps,
-                               const xrz_policy::CandidateAction& action) const {
+    double strategicRouteBonus(
+        const StrategicMaps& maps,
+        const xrz_policy::CandidateAction& action) const {
         const int halfTurnCount = state.observedHalfTurnCount();
         const bool useFfaModel = state.activePlayerCount() > 2;
         double bonus = 0.0;
@@ -203,16 +227,12 @@ class XrzBot : public BasicBot {
         bonus += distanceProgressBonus(maps.enemyGeneralDistances, action, 4.0,
                                        12.0);
         bonus += distanceProgressBonus(maps.cityDistances, action,
-                                       halfTurnCount <= 120 ? 2.4 : 1.6,
-                                       4.0);
+                                       halfTurnCount <= 120 ? 2.4 : 1.6, 4.0);
         bonus += distanceProgressBonus(maps.enemyDistances, action,
-                                       halfTurnCount <= 40 ? 0.5 : 1.4,
-                                       1.5);
-        bonus += distanceProgressBonus(maps.expansionDistances, action,
-                                       halfTurnCount <= 70
-                                           ? (useFfaModel ? 1.6 : 1.2)
-                                           : 0.3,
-                                       0.8);
+                                       halfTurnCount <= 40 ? 0.5 : 1.4, 1.5);
+        bonus += distanceProgressBonus(
+            maps.expansionDistances, action,
+            halfTurnCount <= 70 ? (useFfaModel ? 1.6 : 1.2) : 0.3, 0.8);
         return bonus;
     }
 
@@ -229,13 +249,13 @@ class XrzBot : public BasicBot {
                           action.features));
 
         double heuristicWeight = useFfaModel ? 0.050 : 0.040;
-        double sourceWeight = useFfaModel ? 0.018 : 0.014;
+        double sourceWeight = useFfaModel ? 0.010 : 0.014;
         if (halfTurnCount <= 50) {
             heuristicWeight += useFfaModel ? 0.018 : 0.014;
-            sourceWeight += 0.006;
+            sourceWeight += useFfaModel ? 0.003 : 0.006;
         } else if (halfTurnCount <= 120) {
             heuristicWeight += 0.006;
-            sourceWeight += 0.004;
+            sourceWeight += useFfaModel ? 0.002 : 0.004;
         }
 
         double score = modelScore;

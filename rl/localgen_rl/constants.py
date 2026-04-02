@@ -31,6 +31,8 @@ TURN_SCALE = 200.0
 VISIT_SCALE = 16.0
 NEIGHBOR_SCALE = 4.0
 CAPTURE_MARGIN_SCALE = 32.0
+SOURCE_SCORE_SCALE = 512.0
+HEURISTIC_SCORE_SCALE = 512.0
 
 FEATURE_NAMES = (
     "bias",
@@ -70,6 +72,8 @@ FEATURE_NAMES = (
     "source_enemy_general_closeness",
     "target_enemy_general_closeness",
     "source_enemy_pressure_norm",
+    "source_score_norm",
+    "heuristic_score_norm",
 )
 
 INPUT_FEATURE_COUNT = len(FEATURE_NAMES)

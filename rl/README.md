@@ -6,15 +6,21 @@ from a stronger teacher bot, then optionally run reinforcement-learning
 fine-tuning in a lightweight LocalGen-style environment that matches the same
 feature encoder used by the C++ bot.
 
+The bot remains fully self-contained at runtime: other bots are only used as
+teachers or opponents while generating datasets and evaluating strength, never
+as direct delegates inside `XrzBot` itself.
+
 ## What it does
 
 - runs behavior cloning from JSONL demonstrations generated from real matches
 - optionally performs RL fine-tuning after pretraining
-- uses the same 37-feature split-move action encoding as `src/bots/xrzPolicy.h`
+- uses the same 39-feature split-move action encoding as `src/bots/xrzPolicy.h`
 - logs behavior-cloning and RL metrics to TensorBoard
 - prefers Apple Silicon `mps` automatically when available
-- exports the trained policy directly to `src/bots/generated/xrzRlWeights.h`
+- exports trained policies directly to C++ headers under `src/bots/generated/`
 - stores checkpoints under `rl/checkpoints/`
+- zero-pads older 37-feature datasets automatically so legacy corpora can be
+	mixed with newer dumps that include the extra feature channels
 
 ## Main pieces
 
@@ -31,7 +37,9 @@ feature encoder used by the C++ bot.
 1. Build `LocalGen-bot-imitation-dump` and generate a dataset under
 	 `rl/datasets/`.
 2. Train with behavior cloning, optionally followed by RL fine-tuning.
-3. Let the trainer export `src/bots/generated/xrzRlWeights.h`.
+3. Let the trainer export specialist headers such as
+	`src/bots/generated/xrzRlWeightsDuel.h` and
+	`src/bots/generated/xrzRlWeightsFfa.h`.
 4. Rebuild the C++ project to deploy the updated `XrzBot`.
 
 ## Training
@@ -46,6 +54,14 @@ Useful variants include:
 - custom dataset: `python rl/train_xrz_dqn.py --dataset rl/datasets/your_dump.jsonl`
 - short smoke run: `python rl/train_xrz_dqn.py --skip-rl --bc-epochs 1`
 
+For the current strongest specialist recipe in this repository, train duel and
+FFA separately with the larger default MLP and mixed real-game corpora:
+
+- duel:
+	`python rl/train_xrz_dqn.py --skip-rl --device mps --dataset rl/datasets/xrz_allteachers_duel_maps.jsonl --dataset rl/datasets/xrz_strong_duel.jsonl --dataset rl/datasets/xrz_selfpolicy_duel_train.jsonl --export-header src/bots/generated/xrzRlWeightsDuel.h --export-namespace xrz_rl_duel_model`
+- free-for-all:
+	`python rl/train_xrz_dqn.py --skip-rl --device mps --dataset rl/datasets/xrz_allteachers_ffa_maps.jsonl --dataset rl/datasets/xrz_strong_ffa.jsonl --dataset rl/datasets/xrz_selfpolicy_ffa_train.jsonl --export-header src/bots/generated/xrzRlWeightsFfa.h --export-namespace xrz_rl_ffa_model`
+
 ## TensorBoard
 
 Training logs are written under `rl/runs/`.
@@ -58,10 +74,12 @@ Open TensorBoard with:
 
 - latest checkpoint: `rl/checkpoints/xrz_dqn.pt`
 - best checkpoint: `rl/checkpoints/xrz_dqn_best.pt`
-- exported C++ weights: `src/bots/generated/xrzRlWeights.h`
+- exported generic C++ weights: `src/bots/generated/xrzRlWeights.h`
+- exported duel specialist: `src/bots/generated/xrzRlWeightsDuel.h`
+- exported FFA specialist: `src/bots/generated/xrzRlWeightsFfa.h`
 
-`src/bots/xrzBot.cpp` consumes the exported header directly, so rebuilding the
-project is enough to deploy the most recently exported policy. A 30-feature
-older header can still compile because the shared encoder keeps the leading
-features backward-compatible, but new training runs export the full 37-feature
-model.
+`src/bots/xrzBot.cpp` consumes the exported specialist headers directly, so
+rebuilding the project is enough to deploy the most recently exported policy.
+Older 37-feature datasets and headers can still be reused because the shared
+encoder keeps the leading features backward-compatible and the trainer now pads
+missing feature slots automatically.

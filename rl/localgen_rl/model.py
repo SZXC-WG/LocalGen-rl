@@ -14,18 +14,37 @@ class ActionValueNet(nn.Module):
         input_dim: int = INPUT_FEATURE_COUNT,
         hidden1_size: int = 96,
         hidden2_size: int = 48,
+        hidden3_size: int = 0,
     ) -> None:
         super().__init__()
+        if hidden1_size <= 0 or hidden2_size <= 0:
+            raise ValueError("hidden1_size and hidden2_size must be positive")
+        if hidden3_size < 0:
+            raise ValueError("hidden3_size must be non-negative")
+
         self.input_dim = input_dim
         self.hidden1_size = hidden1_size
         self.hidden2_size = hidden2_size
-        self.backbone = nn.Sequential(
+        self.hidden3_size = hidden3_size
+
+        layers: list[nn.Module] = [
             nn.Linear(input_dim, hidden1_size),
             nn.ReLU(),
             nn.Linear(hidden1_size, hidden2_size),
             nn.ReLU(),
-        )
-        self.q_head = nn.Linear(hidden2_size, 1)
+        ]
+        q_head_input_dim = hidden2_size
+        if hidden3_size > 0:
+            layers.extend(
+                [
+                    nn.Linear(hidden2_size, hidden3_size),
+                    nn.ReLU(),
+                ]
+            )
+            q_head_input_dim = hidden3_size
+
+        self.backbone = nn.Sequential(*layers)
+        self.q_head = nn.Linear(q_head_input_dim, 1)
 
     def forward(self, action_features: torch.Tensor) -> torch.Tensor:
         if action_features.ndim != 3:
@@ -41,8 +60,8 @@ class ActionValueNet(nn.Module):
         q_values = self.q_head(hidden).reshape(batch_size, action_count)
         return q_values
 
-    def architecture(self) -> tuple[int, int, int]:
-        return self.input_dim, self.hidden1_size, self.hidden2_size
+    def architecture(self) -> tuple[int, int, int, int]:
+        return self.input_dim, self.hidden1_size, self.hidden2_size, self.hidden3_size
 
 
 def mask_illegal_q_values(

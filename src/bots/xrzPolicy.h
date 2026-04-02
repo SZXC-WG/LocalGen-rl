@@ -28,8 +28,10 @@ inline constexpr std::size_t kActionsPerSource =
     kDirectionCount * kSplitModeCount;
 inline constexpr std::size_t kDatasetActionCount =
     kCandidateSourceCount * kActionsPerSource;
-inline constexpr std::size_t kFeatureCount = 37;
+inline constexpr std::size_t kFeatureCount = 39;
 inline constexpr double kNegativeInfinity = -1e18;
+inline constexpr double kSourceScoreScale = 512.0;
+inline constexpr double kHeuristicScoreScale = 512.0;
 inline constexpr std::array<Coord, kDirectionCount> kDirs = {
     Coord{-1, 0},
     Coord{0, -1},
@@ -91,7 +93,9 @@ class PolicyState {
 
     bool insideMap(Coord coord) const { return inside(coord); }
 
-    tile_type_e observedTerrainAt(Coord coord) const { return terrainAt(coord); }
+    tile_type_e observedTerrainAt(Coord coord) const {
+        return terrainAt(coord);
+    }
 
     index_t observedOccupierAt(Coord coord) const { return occupierAt(coord); }
 
@@ -520,8 +524,9 @@ class PolicyState {
         action.legal = isLegalMove(source, action.target);
         action.move =
             Move(MoveType::MOVE_ARMY, source, action.target, takeHalf);
-        action.features = buildFeatures(source, directionIndex, takeHalf);
         action.heuristicScore = heuristicPrior(source, action.target, takeHalf);
+        action.features = buildFeatures(source, directionIndex, takeHalf, score,
+                                        action.heuristicScore);
         return action;
     }
 
@@ -553,9 +558,9 @@ class PolicyState {
         return result;
     }
 
-    std::array<double, kFeatureCount> buildFeatures(Coord source,
-                                                    std::size_t directionIndex,
-                                                    bool takeHalf) const {
+    std::array<double, kFeatureCount> buildFeatures(
+        Coord source, std::size_t directionIndex, bool takeHalf,
+        double sourceScoreHint, double heuristicScoreHint) const {
         std::array<double, kFeatureCount> features{};
         const Coord delta = kDirs[directionIndex];
         const Coord target = source + delta;
@@ -609,6 +614,8 @@ class PolicyState {
         features[34] = sourceEnemyGeneralCloseness;
         features[35] = targetEnemyGeneralCloseness;
         features[36] = scale(static_cast<double>(enemyPressure(source)), 64.0);
+        features[37] = scale(sourceScoreHint, kSourceScoreScale);
+        features[38] = scale(heuristicScoreHint, kHeuristicScoreScale);
 
         if (targetInBounds) {
             const tile_type_e targetType = terrainAt(target);

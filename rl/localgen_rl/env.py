@@ -8,11 +8,13 @@ from .constants import (
     ARMY_SCALE,
     CAPTURE_MARGIN_SCALE,
     DIRECTIONS,
+    HEURISTIC_SCORE_SCALE,
     IMPASSABLE_TILE_TYPES,
     INPUT_FEATURE_COUNT,
     LAND_SCALE,
     NEIGHBOR_SCALE,
     OUTPUT_ACTION_COUNT,
+    SOURCE_SCORE_SCALE,
     SPLIT_MODES,
     TOTAL_ARMY_SCALE,
     VISIT_SCALE,
@@ -261,6 +263,7 @@ class LocalGenMiniEnv:
         source_general_distance = self._distance_to_enemy_general(player, source)
         source_general_closeness = self._distance_closeness(source_general_distance)
         source_enemy_pressure = self._enemy_pressure(player, source)
+        source_score = self._source_score(player, source)
 
         action_features: list[list[float]] = []
         legal_mask: list[bool] = []
@@ -305,6 +308,7 @@ class LocalGenMiniEnv:
                 remaining_army = source_cell.army - moved_army
                 capture_margin = moved_army - target_army
                 reverse_last_move = 1.0 if source == last_to and target == last_from else 0.0
+                heuristic_prior = self._heuristic_prior(player, source, target, take_half)
                 features = [
                     1.0,
                     self._scale(source_cell.army, ARMY_SCALE),
@@ -343,6 +347,8 @@ class LocalGenMiniEnv:
                     source_general_closeness,
                     target_general_closeness,
                     self._scale(source_enemy_pressure, ARMY_SCALE),
+                    self._scale(source_score, SOURCE_SCORE_SCALE),
+                    self._scale(heuristic_prior, HEURISTIC_SCORE_SCALE),
                 ]
                 action_features.append(features)
                 legal_mask.append(base_legal)

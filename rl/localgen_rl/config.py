@@ -12,7 +12,7 @@ class TrainingConfig:
     max_half_turns: int = 240
     board_min_size: int = 12
     board_max_size: int = 18
-    bc_epochs: int = 10
+    bc_epochs: int = 24
     bc_batch_size: int = 192
     bc_learning_rate: float = 3e-4
     bc_validation_fraction: float = 0.1
@@ -28,18 +28,35 @@ class TrainingConfig:
     train_interval: int = 4
     target_sync_interval: int = 250
     eval_interval: int = 50
-    eval_episodes: int = 12
+    eval_episodes: int = 24
     log_interval: int = 10
-    hidden1_size: int = 96
-    hidden2_size: int = 48
+    hidden1_size: int = 256
+    hidden2_size: int = 128
+    hidden3_size: int = 0
     device: str = "auto"
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    def resolve(self, repo_root: Path) -> dict[str, Any]:
+    def resolve(
+        self,
+        repo_root: Path,
+        *,
+        export_header_path: Path | None = None,
+    ) -> dict[str, Any]:
         rl_root = repo_root / "rl"
         dataset_path = rl_root / "datasets" / "xrz_imitation.jsonl"
+        default_export_header_path = (
+            repo_root / "src" / "bots" / "generated" / "xrzRlWeights.h"
+        )
+        resolved_export_header_path = export_header_path or default_export_header_path
+        if not resolved_export_header_path.is_absolute():
+            resolved_export_header_path = repo_root / resolved_export_header_path
+
+        checkpoint_stem = "xrz_dqn"
+        if resolved_export_header_path != default_export_header_path:
+            checkpoint_stem = resolved_export_header_path.stem
+
         return {
             "repo_root": repo_root,
             "rl_root": rl_root,
@@ -47,7 +64,7 @@ class TrainingConfig:
             "dataset_paths": [dataset_path],
             "runs_dir": rl_root / "runs",
             "checkpoints_dir": rl_root / "checkpoints",
-            "checkpoint_path": rl_root / "checkpoints" / "xrz_dqn.pt",
-            "best_checkpoint_path": rl_root / "checkpoints" / "xrz_dqn_best.pt",
-            "export_header_path": repo_root / "src" / "bots" / "generated" / "xrzRlWeights.h",
+            "checkpoint_path": rl_root / "checkpoints" / f"{checkpoint_stem}.pt",
+            "best_checkpoint_path": rl_root / "checkpoints" / f"{checkpoint_stem}_best.pt",
+            "export_header_path": resolved_export_header_path,
         }
